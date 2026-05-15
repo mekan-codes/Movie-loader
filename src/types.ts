@@ -17,6 +17,27 @@ export type SourceType = "search" | "directPage" | "webviewOnly";
 export type SourceOpenBehavior = "webview" | "nativeThenWebview";
 export type ResultPageBehavior = "result_page" | "search_page";
 export type AmbiguousQueryBehavior = "show_choices" | "open_search_page";
+export type ParserMode = "static" | "webview" | "hybrid" | "fallbackOnly";
+export type ResultQuality = "excellent" | "good" | "medium" | "weak" | "failed";
+
+export interface SourceDebugInfo {
+  generatedSearchUrl?: string | null;
+  finalLoadedUrl?: string | null;
+  parserModeUsed?: ParserMode | string | null;
+  staticFetchWorked?: boolean | null;
+  staticParseWorked?: boolean | null;
+  webViewParseWorked?: boolean | null;
+  htmlLength?: number | null;
+  resultContainerCount?: number | null;
+  candidateTitles?: string[];
+  candidateLinks?: string[];
+  bestScore?: number | null;
+  whyAutoOpenFailed?: string | null;
+  javascriptProbablyRequired?: boolean | null;
+  browserPreviewLimited?: boolean | null;
+  timeoutOrError?: string | null;
+  finalAction?: "exact page" | "show choices" | "search fallback" | "failed" | string | null;
+}
 
 export interface SourceConfig {
   id: string;
@@ -34,6 +55,7 @@ export interface SourceConfig {
   resultOpenBehavior?: ResultPageBehavior;
   ambiguousQueryBehavior?: AmbiguousQueryBehavior;
   sourceKind?: SourceKind;
+  parserMode?: ParserMode;
   baseUrl: string;
   searchUrl: string;
   method: "GET" | "POST" | string;
@@ -90,6 +112,10 @@ export interface SearchResult {
   year?: string | null;
   description?: string | null;
   confidence: number;
+  quality?: ResultQuality;
+  reason?: string | null;
+  sourceReliability?: number;
+  debugInfo?: SourceDebugInfo | null;
   rawData?: Record<string, string>;
 }
 
@@ -111,6 +137,7 @@ export interface SourceSearchOutcome {
   message?: string | null;
   elapsedMs: number;
   results: SearchResult[];
+  debugInfo?: SourceDebugInfo | null;
 }
 
 export interface SourceTestResult {
@@ -128,6 +155,7 @@ export interface SourceTestResult {
   finalOpenUrl?: string | null;
   querySpecificity?: string | null;
   ambiguous?: boolean;
+  debugInfo?: SourceDebugInfo | null;
 }
 
 export interface SourcePreviewResult {

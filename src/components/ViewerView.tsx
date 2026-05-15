@@ -383,6 +383,7 @@ function fallbackSourceForItem(item: SearchResult): SourceConfig {
     sourceOpenBehavior: "webview",
     resultOpenBehavior: "result_page",
     ambiguousQueryBehavior: "show_choices",
+    parserMode: "hybrid",
     baseUrl,
     searchUrl: item.url,
     method: "GET",

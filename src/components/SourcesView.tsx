@@ -24,6 +24,7 @@ import type {
   SelectorCandidate,
   ResultPageBehavior,
   AmbiguousQueryBehavior,
+  ParserMode,
   SourceConfig,
   SourceKind,
   SourceOpenBehavior,
@@ -65,20 +66,40 @@ const resultSelectorCandidates = [
   ".card",
   ".poster",
   ".video",
-  ".entry"
+  ".entry",
+  ".result",
+  ".ml-item",
+  ".flw-item",
+  ".film_list-wrap .flw-item",
+  ".content .item",
+  ".short",
+  ".b-content__inline_item"
 ];
 
 const titleSelectorCandidates = [
   "h1",
   "h2",
   "h3",
+  "h4",
   ".title",
   ".name",
   ".movie-title",
+  ".film-title",
+  ".entry-title",
+  ".b-content__inline_item-link",
+  ".short-title",
   "[title]"
 ];
 
-const posterSelectorCandidates = ["img", ".poster img", "picture img"];
+const posterSelectorCandidates = [
+  "img",
+  ".poster img",
+  ".thumb img",
+  "picture img",
+  "img[data-src]",
+  "img[data-original]",
+  "img[data-lazy-src]"
+];
 
 export function SourcesView({
   sources,
@@ -101,8 +122,12 @@ export function SourcesView({
   const [busy, setBusy] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<SourceTestResult | null>(null);
+  const [diagnosticResults, setDiagnosticResults] = useState<
+    Array<{ source: SourceConfig; result: SourceTestResult }>
+  >([]);
+  const [diagnosticsRunning, setDiagnosticsRunning] = useState(false);
   const [quickUrl, setQuickUrl] = useState("");
-  const [testQuery, setTestQuery] = useState("gravity falls");
+  const [testQuery, setTestQuery] = useState("john wick");
   const [undoDraft, setUndoDraft] = useState<SourceConfig>(() => draft);
   const [undoHeadersText, setUndoHeadersText] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -282,7 +307,8 @@ export function SourcesView({
         sourceKind === "direct"
           ? current.waitForSelector || current.resultSelector || ".movie-card, .card, .item, article"
           : current.waitForSelector || "",
-      requiresJavaScript: sourceKind === "web" ? true : current.requiresJavaScript
+      requiresJavaScript: sourceKind === "web" ? true : current.requiresJavaScript,
+      parserMode: sourceKind === "direct" ? "static" : "hybrid"
     }));
   };
 
@@ -296,6 +322,7 @@ export function SourcesView({
         sourceKind: template.patch.sourceKind ?? current.sourceKind,
         sourceType: template.patch.sourceType ?? current.sourceType,
         sourceOpenBehavior: template.patch.sourceOpenBehavior ?? current.sourceOpenBehavior,
+        parserMode: template.patch.parserMode ?? current.parserMode,
         resultOpenBehavior: template.patch.resultOpenBehavior ?? current.resultOpenBehavior,
         ambiguousQueryBehavior:
           template.patch.ambiguousQueryBehavior ?? current.ambiguousQueryBehavior,
@@ -333,6 +360,7 @@ export function SourcesView({
       normalizeSource({
         ...current,
         sourceKind: "direct",
+        parserMode: "hybrid",
         requiresJavaScript: false,
         resultSelector: ".movie-card, .card, .item, article, a[href]",
         waitForSelector: ".movie-card, .card, .item, article, a[href]",
@@ -344,6 +372,69 @@ export function SourcesView({
       })
     );
     setMessage("Common selector candidates applied. Test the source to preview matches.");
+  };
+
+  const autoFixDraft = async () => {
+    setTestingId(draft.id);
+    setMessage(null);
+    try {
+      const sourceForTest = normalizeForSave(draft, headersText);
+      validateDraft(sourceForTest, Boolean(headersText.trim()));
+      const result = await onTest(sourceForTest, testQuery || "john wick");
+      setTestResult(result);
+      const resultSelector = bestSelector(result.detectedSelectors, "result")?.selector;
+      const titleSelector = bestSelector(result.detectedSelectors, "title")?.selector;
+      const posterSelector = bestSelector(result.detectedSelectors, "poster")?.selector;
+      setUndoDraft(draft);
+      setUndoHeadersText(headersText);
+      setShowAdvanced(true);
+      setDraft((current) =>
+        normalizeSource({
+          ...current,
+          sourceKind: "direct",
+          requiresJavaScript:
+            result.debugInfo?.javascriptProbablyRequired ?? result.fallbackUsed ?? current.requiresJavaScript,
+          resultSelector: resultSelector || current.resultSelector || ".movie-card, .card, .item, article, a[href]",
+          waitForSelector: resultSelector || current.waitForSelector || current.resultSelector,
+          titleSelector: titleSelector || current.titleSelector || ".title, .name, .movie-title, h2, h3, [title]",
+          linkSelector: current.linkSelector || "a[href]",
+          linkAttribute: current.linkAttribute || "href",
+          posterSelector: posterSelector || current.posterSelector,
+          posterAttribute: current.posterAttribute || "src",
+          loadDelayMs: result.fallbackUsed ? Math.max(current.loadDelayMs ?? 1500, 2500) : current.loadDelayMs,
+          parserMode: result.fallbackUsed ? "hybrid" : current.parserMode || "hybrid"
+        })
+      );
+      setMessage(
+        resultSelector
+          ? "Auto-fix found selector suggestions. Review the preview, then save the source."
+          : "Auto-fix could not find strong selectors. Review diagnostics before saving."
+      );
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setTestingId(null);
+    }
+  };
+
+  const runDiagnostics = async () => {
+    setDiagnosticsRunning(true);
+    setMessage(null);
+    try {
+      const targets = sources.filter((source) => !source.isDeleted && !source.hidden);
+      const results = await Promise.all(
+        targets.map(async (source) => ({
+          source: normalizeSource(source),
+          result: await onTest(normalizeSource(source), testQuery || "john wick")
+        }))
+      );
+      setDiagnosticResults(results);
+      setMessage(`Diagnostics complete for ${results.length} source${results.length === 1 ? "" : "s"}.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDiagnosticsRunning(false);
+    }
   };
 
   const useCandidate = (candidate: SelectorCandidate) => {
@@ -396,6 +487,15 @@ export function SourcesView({
           >
             <RotateCcw size={17} />
             <span>Reset defaults</span>
+          </button>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => void runDiagnostics()}
+            disabled={diagnosticsRunning}
+          >
+            {diagnosticsRunning ? <RefreshCw className="spin" size={17} /> : <TestTube2 size={17} />}
+            <span>Diagnostics</span>
           </button>
           {trashCount > 0 && (
             <button
@@ -488,6 +588,30 @@ export function SourcesView({
           Trash {trashCount}
         </button>
       </div>
+
+      {diagnosticResults.length > 0 && (
+        <section className="diagnostics-panel">
+          <div>
+            <strong>Source Diagnostics</strong>
+            <span>Query: {testQuery || "john wick"}</span>
+          </div>
+          <div className="diagnostics-grid">
+            {diagnosticResults.map(({ source, result }) => (
+              <article key={source.id} className="diagnostics-card">
+                <strong>{source.name}</strong>
+                <span>{result.finalSearchUrl || "n/a"}</span>
+                <small>Status: {result.rawStatus || (result.ok ? "loaded" : "failed")}</small>
+                <small>Parser: {result.debugInfo?.parserModeUsed || source.parserMode || "hybrid"}</small>
+                <small>Candidates: {result.resultCount}</small>
+                <small>Best score: {result.debugInfo?.bestScore ?? result.bestMatch?.score ?? "n/a"}</small>
+                <small>Final action: {result.debugInfo?.finalAction || (result.fallbackUsed ? "search fallback" : "exact page")}</small>
+                <small>Top titles: {result.debugInfo?.candidateTitles?.slice(0, 5).join(", ") || result.previewResults?.slice(0, 5).map((item) => item.title).join(", ") || "none"}</small>
+                <small>Top URLs: {result.debugInfo?.candidateLinks?.slice(0, 5).join(", ") || result.previewResults?.slice(0, 5).map((item) => item.url).join(", ") || "none"}</small>
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
 
       <div className="source-layout">
         <div className="source-list" aria-label="Sources">
@@ -722,6 +846,18 @@ export function SourcesView({
                 <option value="search">Search page only</option>
                 <option value="directPage">Direct video page</option>
                 <option value="webviewOnly">WebView only</option>
+              </select>
+            </label>
+            <label>
+              <span>Parser mode</span>
+              <select
+                value={draft.parserMode || "hybrid"}
+                onChange={(event) => updateDraft("parserMode", event.target.value as ParserMode)}
+              >
+                <option value="hybrid">Hybrid</option>
+                <option value="static">Static HTML parser</option>
+                <option value="webview">JavaScript/WebView parser</option>
+                <option value="fallbackOnly">WebView fallback only</option>
               </select>
             </label>
           </div>
@@ -1236,6 +1372,19 @@ export function SourcesView({
               )}
               <span>Test</span>
             </button>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => void autoFixDraft()}
+              disabled={testingId === draft.id}
+            >
+              {testingId === draft.id ? (
+                <RefreshCw className="spin" size={17} />
+              ) : (
+                <Wand2 size={17} />
+              )}
+              <span>Auto-fix source</span>
+            </button>
             {draft.isDefault && (
               <button
                 className="secondary-button"
@@ -1282,7 +1431,12 @@ export function SourcesView({
               </label>
               <span>URL: {testResult.finalSearchUrl || "n/a"}</span>
               <span>Status: {testResult.rawStatus || (testResult.ok ? "loaded" : "failed")}</span>
+              <span>Parser mode: {testResult.debugInfo?.parserModeUsed || draft.parserMode || "hybrid"}</span>
+              <span>HTML length: {testResult.debugInfo?.htmlLength ?? "n/a"}</span>
               <span>Selector matches: {testResult.selectorMatchCount ?? testResult.resultCount}</span>
+              <span>Candidate titles: {testResult.debugInfo?.candidateTitles?.slice(0, 5).join(", ") || "none"}</span>
+              <span>Best score: {testResult.debugInfo?.bestScore ?? "n/a"}</span>
+              <span>Final action: {testResult.debugInfo?.finalAction || "n/a"}</span>
               <span>Fallback provider card: {testResult.fallbackUsed ? "yes" : "no"}</span>
               {testResult.querySpecificity && (
                 <span>
@@ -1350,6 +1504,17 @@ interface SourceTemplate {
   patch: Partial<SourceConfig>;
 }
 
+function bestSelector(
+  candidates: SelectorCandidate[] | undefined,
+  selectorType: SelectorCandidate["selectorType"]
+): SelectorCandidate | null {
+  return (
+    candidates
+      ?.filter((candidate) => candidate.selectorType === selectorType)
+      .sort((left, right) => right.matchCount - left.matchCount)[0] ?? null
+  );
+}
+
 const sourceTemplates: SourceTemplate[] = [
   {
     label: "Basic search page",
@@ -1358,6 +1523,7 @@ const sourceTemplates: SourceTemplate[] = [
       sourceKind: "web",
       sourceType: "search",
       sourceOpenBehavior: "webview",
+      parserMode: "hybrid",
       resultOpenBehavior: "result_page",
       ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: true,
@@ -1379,6 +1545,7 @@ const sourceTemplates: SourceTemplate[] = [
       sourceKind: "direct",
       sourceType: "search",
       sourceOpenBehavior: "nativeThenWebview",
+      parserMode: "hybrid",
       resultOpenBehavior: "result_page",
       ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: false,
@@ -1405,6 +1572,7 @@ const sourceTemplates: SourceTemplate[] = [
       sourceKind: "web",
       sourceType: "directPage",
       sourceOpenBehavior: "nativeThenWebview",
+      parserMode: "hybrid",
       resultOpenBehavior: "result_page",
       ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: true,
@@ -1423,6 +1591,7 @@ const sourceTemplates: SourceTemplate[] = [
       sourceKind: "web",
       sourceType: "webviewOnly",
       sourceOpenBehavior: "webview",
+      parserMode: "fallbackOnly",
       resultOpenBehavior: "search_page",
       ambiguousQueryBehavior: "open_search_page",
       requiresJavaScript: true,
@@ -1443,6 +1612,7 @@ const sourceTemplates: SourceTemplate[] = [
       sourceKind: "web",
       sourceType: "search",
       sourceOpenBehavior: "webview",
+      parserMode: "hybrid",
       resultOpenBehavior: "result_page",
       ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: true,

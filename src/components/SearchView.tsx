@@ -13,6 +13,7 @@ import { useState } from "react";
 import type {
   Favorite,
   SearchResult,
+  SourceDebugInfo,
   SourceConfig,
   SourceSearchOutcome,
   SourceSearchStatus
@@ -293,6 +294,9 @@ function ResultCard({
   const alternatives = parseAlternatives(result);
   const isProviderCard = result.rawData?.resultKind === "provider";
   const resolutionLabel = resultLabel(result, isProviderCard);
+  const quality = resultQuality(result);
+  const reason = result.reason || result.rawData?.confidenceReason || resolutionLabel;
+  const debugInfo = debugInfoForResult(result);
 
   return (
     <article className="result-card">
@@ -307,27 +311,30 @@ function ResultCard({
         <div className="result-title-row">
           <h3>{result.title}</h3>
           {result.year && <span className="year-pill">{result.year}</span>}
+          <span className={cx("quality-badge", `quality-${quality}`)}>{quality}</span>
         </div>
         <div className="result-meta">
           <span>{result.sourceName}</span>
           <span>{result.openMode === "webview" ? "In-app viewer" : "Direct video"}</span>
           <span>{resolutionLabel}</span>
-          {!isProviderCard && <span>{Math.round(result.confidence)}% match</span>}
+          <span>{Math.round(result.confidence)}% match</span>
         </div>
+        <p className="result-reason">{reason}</p>
         {result.description && <p>{result.description}</p>}
         <div className="card-actions">
           <button type="button" className="primary-button compact" onClick={onOpen}>
             <Play size={16} />
-            <span>{isProviderCard ? "Open search" : result.openMode === "webview" ? "Open page" : "Play"}</span>
+            <span>{result.openMode === "webview" ? "Open inside app" : "Play"}</span>
           </button>
           {result.openMode === "webview" && (
             <button
               type="button"
-              className="icon-button"
+              className="secondary-button compact"
               onClick={onOpenExternal}
               title="Open in system browser"
             >
               <ExternalLink size={16} />
+              <span>Browser</span>
             </button>
           )}
           <button
@@ -339,6 +346,12 @@ function ResultCard({
             <Star size={17} fill={isFavorite ? "currentColor" : "none"} />
           </button>
         </div>
+        {(isProviderCard || quality === "weak" || debugInfo) && (
+          <details className="more-options debug-details">
+            <summary>{isProviderCard || quality === "weak" ? "Why fallback?" : "Debug"}</summary>
+            <DebugInfoList debugInfo={debugInfo} result={result} />
+          </details>
+        )}
         {alternatives.length > 0 && (
           <details className="more-options">
             <summary>More options</summary>
@@ -388,6 +401,76 @@ function resultLabel(result: SearchResult, isProviderCard: boolean): string {
     return "Ready to play";
   }
   return "Movie page found";
+}
+
+function resultQuality(result: SearchResult): string {
+  return result.quality || result.rawData?.quality || (result.rawData?.resolution === "fallback" ? "weak" : "good");
+}
+
+function debugInfoForResult(result: SearchResult): SourceDebugInfo | null {
+  if (result.debugInfo) {
+    return result.debugInfo;
+  }
+  const rawDebug = result.rawData?.fallbackDebug;
+  if (!rawDebug) {
+    return null;
+  }
+  try {
+    return JSON.parse(rawDebug) as SourceDebugInfo;
+  } catch {
+    return null;
+  }
+}
+
+function DebugInfoList({
+  debugInfo,
+  result
+}: {
+  debugInfo: SourceDebugInfo | null;
+  result: SearchResult;
+}) {
+  const rows: Array<[string, string]> = [
+    ["Generated search URL", debugInfo?.generatedSearchUrl || result.url],
+    ["Final loaded URL", debugInfo?.finalLoadedUrl || result.url],
+    ["Parser mode", String(debugInfo?.parserModeUsed || "unknown")],
+    ["Static fetch", boolLabel(debugInfo?.staticFetchWorked)],
+    ["Static parse", boolLabel(debugInfo?.staticParseWorked)],
+    ["WebView parse", boolLabel(debugInfo?.webViewParseWorked)],
+    ["HTML length", debugInfo?.htmlLength == null ? "n/a" : String(debugInfo.htmlLength)],
+    [
+      "Result containers",
+      debugInfo?.resultContainerCount == null ? "n/a" : String(debugInfo.resultContainerCount)
+    ],
+    ["Top titles", debugInfo?.candidateTitles?.slice(0, 5).join(", ") || "none"],
+    ["Top URLs", debugInfo?.candidateLinks?.slice(0, 5).join(", ") || "none"],
+    ["Best score", debugInfo?.bestScore == null ? String(Math.round(result.confidence)) : String(debugInfo.bestScore)],
+    ["Auto-open", debugInfo?.whyAutoOpenFailed || result.reason || result.rawData?.confidenceReason || "n/a"],
+    ["JavaScript likely", boolLabel(debugInfo?.javascriptProbablyRequired)],
+    ["Browser preview limit", boolLabel(debugInfo?.browserPreviewLimited)],
+    ["Error", debugInfo?.timeoutOrError || "none"],
+    ["Final action", debugInfo?.finalAction || result.rawData?.resolution || "n/a"]
+  ];
+
+  return (
+    <dl className="debug-grid">
+      {rows.map(([label, value]) => (
+        <div key={label}>
+          <dt>{label}</dt>
+          <dd title={value}>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function boolLabel(value: boolean | null | undefined): string {
+  if (value === true) {
+    return "yes";
+  }
+  if (value === false) {
+    return "no";
+  }
+  return "n/a";
 }
 
 function StatusBadge({

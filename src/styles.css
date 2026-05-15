@@ -377,6 +377,52 @@ p {
   gap: 8px;
 }
 
+.diagnostics-panel {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0 16px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.diagnostics-panel > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.diagnostics-panel strong {
+  color: var(--text);
+}
+
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 8px;
+}
+
+.diagnostics-card {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel), var(--panel-2) 35%);
+}
+
+.diagnostics-card span,
+.diagnostics-card small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .chip.is-selected {
   color: #071513;
   background: var(--accent);
@@ -563,7 +609,8 @@ p {
 }
 
 .year-pill,
-.source-badge {
+.source-badge,
+.quality-badge {
   flex: none;
   min-height: 22px;
   padding: 3px 7px;
@@ -572,6 +619,27 @@ p {
   background: color-mix(in srgb, var(--accent), transparent 86%);
   font-size: 12px;
   font-weight: 750;
+}
+
+.quality-badge {
+  text-transform: capitalize;
+}
+
+.quality-excellent,
+.quality-good {
+  color: var(--accent-strong);
+  background: color-mix(in srgb, var(--accent), transparent 86%);
+}
+
+.quality-medium {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning), transparent 88%);
+}
+
+.quality-weak,
+.quality-failed {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger), transparent 88%);
 }
 
 .result-card p {
@@ -583,6 +651,12 @@ p {
   color: var(--muted);
   font-size: 13px;
   line-height: 1.45;
+}
+
+.result-card p.result-reason {
+  -webkit-line-clamp: 2;
+  color: var(--text);
+  font-size: 12px;
 }
 
 .card-actions {
@@ -604,6 +678,35 @@ p {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.debug-details {
+  font-size: 12px;
+}
+
+.debug-grid {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.debug-grid div {
+  display: grid;
+  grid-template-columns: 138px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.debug-grid dt {
+  color: var(--muted);
+  font-weight: 750;
+}
+
+.debug-grid dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .source-empty,

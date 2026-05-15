@@ -5,9 +5,11 @@ import { isPlayableVideoUrl } from "../media";
 import type {
   Favorite,
   HistoryItem,
+  ParserMode,
   SelectorCandidate,
   SearchResult,
   SourceConfig,
+  SourceDebugInfo,
   SourceSearchOutcome,
   SourceTestResult
 } from "../types";
@@ -43,6 +45,12 @@ const commonResultSelectors = [
   ".poster",
   ".thumb",
   ".result",
+  ".ml-item",
+  ".flw-item",
+  ".film_list-wrap .flw-item",
+  ".content .item",
+  ".short",
+  ".b-content__inline_item",
   "a[href]"
 ];
 
@@ -56,6 +64,8 @@ const commonTitleSelectors = [
   ".movie-title",
   ".film-title",
   ".entry-title",
+  ".b-content__inline_item-link",
+  ".short-title",
   "[title]",
   "img[alt]"
 ];
@@ -67,10 +77,20 @@ const commonLinkSelectors = [
   ".poster a",
   ".thumb a",
   "article a",
-  ".card a"
+  ".card a",
+  ".b-content__inline_item-link",
+  ".short-title a"
 ];
 
-const commonPosterSelectors = ["img", ".poster img", ".thumb img", "picture img"];
+const commonPosterSelectors = [
+  "img",
+  ".poster img",
+  ".thumb img",
+  "picture img",
+  "img[data-src]",
+  "img[data-original]",
+  "img[data-lazy-src]"
+];
 const commonYearSelectors = [".year", ".date", ".release"];
 const broadFranchiseQueries = new Set([
   "batman",
@@ -283,7 +303,7 @@ export const api = {
     query: string,
     sourceIds: string[] | null
   ): Promise<SourceSearchOutcome[]> {
-    return searchCustomSources(query, sourceIds);
+    return (await searchCustomSources(query, sourceIds)).sort(compareOutcomes);
   },
 
   async listFavorites(): Promise<Favorite[]> {
@@ -398,7 +418,7 @@ async function searchStoredSources(
     sources.map((source) => searchBrowserSource(source, query))
   );
 
-  return outcomes.map((outcome, index) => {
+  return outcomes.map<SourceSearchOutcome>((outcome, index) => {
     if (outcome.status === "fulfilled") {
       return outcome.value;
     }
@@ -406,12 +426,12 @@ async function searchStoredSources(
     return {
       sourceId: source.id,
       sourceName: source.name,
-      status: "error",
+      status: "error" as const,
       message: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason),
       elapsedMs: 0,
       results: []
     };
-  });
+  }).sort(compareOutcomes);
 }
 
 function migrateStoredSources(
@@ -572,7 +592,8 @@ function providerFallbackResult(
   source: SourceConfig,
   query: string,
   url: string,
-  description = "Could not parse exact result. Open source search page."
+  description = "Could not parse exact result. Open source search page.",
+  debugInfo: SourceDebugInfo | null = null
 ): SearchResult {
   return {
     id: stableId(`${source.id}:${url}`, "result"),
@@ -586,11 +607,18 @@ function providerFallbackResult(
     year: null,
     description,
     confidence: 0,
+    quality: "weak",
+    reason: "Search fallback",
+    sourceReliability: sourceReliability(source),
+    debugInfo,
     rawData: {
       provider: "fallback-provider",
       resultKind: "provider",
       primary: "true",
-      resolution: "fallback"
+      resolution: "fallback",
+      quality: "weak",
+      confidenceReason: "Search fallback",
+      fallbackDebug: JSON.stringify(debugInfo || {})
     }
   };
 }
@@ -609,11 +637,22 @@ function directPageResult(source: SourceConfig, query: string, url: string): Sea
     year: null,
     description: "Configured direct page. Opens inside CineFinder.",
     confidence: 100,
+    quality: "excellent",
+    reason: "Configured direct page.",
+    sourceReliability: sourceReliability(source),
+    debugInfo: {
+      generatedSearchUrl: url,
+      finalLoadedUrl: url,
+      parserModeUsed: source.parserMode || "hybrid",
+      bestScore: 100,
+      finalAction: "exact page"
+    },
     rawData: {
       provider: "direct-page",
       resultKind: "parsed",
       primary: "true",
       resolution: "exact",
+      quality: "excellent",
       confidenceReason: "Configured direct page."
     }
   };
@@ -725,37 +764,65 @@ async function searchBrowserSource(
 ): Promise<SourceSearchOutcome> {
   const started = performance.now();
   const searchUrl = buildSourceSearchUrl(source, query);
+  const parserMode = parserModeForSource(source);
+  const debugInfo: SourceDebugInfo = {
+    generatedSearchUrl: searchUrl,
+    finalLoadedUrl: searchUrl,
+    parserModeUsed: parserMode,
+    staticFetchWorked: null,
+    staticParseWorked: null,
+    webViewParseWorked: null,
+    htmlLength: null,
+    resultContainerCount: 0,
+    candidateTitles: [],
+    candidateLinks: [],
+    bestScore: null,
+    whyAutoOpenFailed: null,
+    javascriptProbablyRequired: source.requiresJavaScript,
+    browserPreviewLimited: !isTauri() && (parserMode === "webview" || parserMode === "hybrid"),
+    timeoutOrError: null,
+    finalAction: null
+  };
 
-  if (source.sourceType === "webviewOnly") {
+  if (source.sourceType === "webviewOnly" || parserMode === "fallbackOnly") {
+    debugInfo.finalAction = "search fallback";
+    debugInfo.whyAutoOpenFailed = "Source is configured for fallback-only/WebView search.";
     return {
       sourceId: source.id,
       sourceName: source.name,
       status: "ready",
       message: "WebView-only source. Open source search page.",
       elapsedMs: Math.round(performance.now() - started),
-      results: [providerFallbackResult(source, query, searchUrl)]
+      results: [providerFallbackResult(source, query, searchUrl, "WebView-only source. Open source search page.", debugInfo)],
+      debugInfo
     };
   }
 
   if (source.resultOpenBehavior === "search_page") {
+    debugInfo.finalAction = "search fallback";
+    debugInfo.whyAutoOpenFailed = "Source is configured to open the search page.";
     return {
       sourceId: source.id,
       sourceName: source.name,
       status: "ready",
       message: "Configured to open the source search page.",
       elapsedMs: Math.round(performance.now() - started),
-      results: [providerFallbackResult(source, query, searchUrl)]
+      results: [providerFallbackResult(source, query, searchUrl, "Configured to open the source search page.", debugInfo)],
+      debugInfo
     };
   }
 
   if (source.sourceType === "directPage") {
+    debugInfo.finalAction = "exact page";
+    debugInfo.bestScore = 100;
     return {
       sourceId: source.id,
       sourceName: source.name,
       status: "found",
       message: "Direct page source. Opening configured page.",
       elapsedMs: Math.round(performance.now() - started),
-      results: [directPageResult(source, query, searchUrl)]
+      results: [directPageResult(source, query, searchUrl)],
+      debugInfo
     };
   }
 
@@ -766,25 +833,39 @@ async function searchBrowserSource(
       status: "unsupported",
       message: "Only GET sources are supported in v1.",
       elapsedMs: 0,
-      results: []
+      results: [],
+      debugInfo: { ...debugInfo, finalAction: "failed", timeoutOrError: "Only GET sources are supported." }
     };
   }
 
   try {
     const html = await fetchBrowserSearchHtml(source, searchUrl);
+    debugInfo.staticFetchWorked = true;
+    debugInfo.htmlLength = html.length;
     const candidates = parseBrowserResults(source, query, searchUrl, html);
+    debugInfo.staticParseWorked = candidates.length > 0;
+    debugInfo.resultContainerCount = candidates.length;
+    debugInfo.candidateTitles = candidates.slice(0, 5).map((candidate) => candidate.title);
+    debugInfo.candidateLinks = candidates.slice(0, 5).map((candidate) => candidate.url);
+    debugInfo.bestScore = candidates[0]?.confidence ?? null;
     const decision = decideResolution(source, query, candidates);
     if (decision.fallbackToSearch || decision.results.length === 0) {
+      debugInfo.finalAction = "search fallback";
+      debugInfo.whyAutoOpenFailed = decision.reason;
       return {
         sourceId: source.id,
         sourceName: source.name,
         status: "ready",
         message: decision.reason,
         elapsedMs: Math.round(performance.now() - started),
-        results: [providerFallbackResult(source, query, searchUrl, decision.reason)]
+        results: [providerFallbackResult(source, query, searchUrl, decision.reason, debugInfo)],
+        debugInfo
       };
     }
     const results = await resolveBrowserResultTargets(source, searchUrl, decision.results);
+    const finalAction = decision.ambiguous ? "show choices" : "exact page";
+    debugInfo.finalAction = results.length > 0 ? finalAction : "search fallback";
+    debugInfo.whyAutoOpenFailed = results.length > 0 ? null : "Parsed results were empty after target resolution.";
     return {
       sourceId: source.id,
       sourceName: source.name,
@@ -794,18 +875,27 @@ async function searchBrowserSource(
           ? decision.reason
           : "No parsed results. Open source search page.",
       elapsedMs: Math.round(performance.now() - started),
-      results: results.length > 0 ? results : [providerFallbackResult(source, query, searchUrl)]
+      results: results.length > 0 ? results : [providerFallbackResult(source, query, searchUrl, "No parsed results. Open source search page.", debugInfo)],
+      debugInfo
     };
   } catch (error) {
     const timedOut = error instanceof DOMException && error.name === "AbortError";
+    debugInfo.staticFetchWorked = false;
+    debugInfo.finalAction = timedOut ? "failed" : "search fallback";
+    debugInfo.timeoutOrError = timedOut
+      ? `Timed out after ${source.requestTimeoutMs ?? 15000}ms.`
+      : browserSourceErrorMessage(error);
     if (isSelectorMissingError(error)) {
+      debugInfo.finalAction = "search fallback";
+      debugInfo.whyAutoOpenFailed = "No result containers matched the configured or common selectors.";
       return {
         sourceId: source.id,
         sourceName: source.name,
         status: "ready",
         message: "No parsed results. Open source search page.",
         elapsedMs: Math.round(performance.now() - started),
-        results: [providerFallbackResult(source, query, searchUrl)]
+        results: [providerFallbackResult(source, query, searchUrl, "No parsed results. Open source search page.", debugInfo)],
+        debugInfo
       };
     }
     return {
@@ -816,7 +906,8 @@ async function searchBrowserSource(
         ? "Timed out after 15 seconds."
         : browserSourceErrorMessage(error),
       elapsedMs: Math.round(performance.now() - started),
-      results: timedOut ? [] : [providerFallbackResult(source, query, searchUrl)]
+      results: timedOut ? [] : [providerFallbackResult(source, query, searchUrl, browserSourceErrorMessage(error), debugInfo)],
+      debugInfo
     };
   }
 }
@@ -916,8 +1007,11 @@ function decideResolution(
       return {
         ...candidate,
         confidence: scored.score,
+        quality: qualityForScore(scored.score, "parsed"),
+        reason: scored.reason,
         rawData: {
           ...candidate.rawData,
+          quality: qualityForScore(scored.score, "parsed"),
           confidenceReason: scored.reason
         }
       };
@@ -968,12 +1062,15 @@ function decideResolution(
       };
     }
     const choices = ranked.slice(0, 5).map((result) => ({
-      ...result,
-      rawData: {
-        ...result.rawData,
-        resolution: "ambiguous",
-        querySpecificity: specificity.reason
-      }
+        ...result,
+        quality: "medium" as const,
+        reason: "Multiple possible matches",
+        rawData: {
+          ...result.rawData,
+          quality: "medium",
+          resolution: "ambiguous",
+          querySpecificity: specificity.reason
+        }
     }));
     return {
       specific: specificity.specific,
@@ -996,8 +1093,11 @@ function decideResolution(
     results: [
       {
         ...best,
+        quality: qualityForScore(best.confidence, "exact"),
+        reason: best.rawData?.confidenceReason || "Strong title match.",
         rawData: {
           ...best.rawData,
+          quality: qualityForScore(best.confidence, "exact"),
           resolution: "exact",
           querySpecificity: specificity.reason
         }
@@ -1194,6 +1294,7 @@ function parseBrowserResultsWithSelector(
       seen.add(key);
       const scored = scoreResultCandidate(query, title, year);
       const confidence = scored.score;
+      const quality = qualityForScore(confidence, "parsed");
 
       return [
         {
@@ -1208,10 +1309,14 @@ function parseBrowserResultsWithSelector(
           year,
           description,
           confidence,
+          quality,
+          reason: scored.reason,
+          sourceReliability: sourceReliability(source),
           rawData: {
             provider: "custom-browser",
             rank: String(index + 1),
             resultSelector,
+            quality,
             confidenceReason: scored.reason,
             querySpecificity: isSpecificQuery(query).reason
           }
@@ -1507,6 +1612,100 @@ function browserSourceErrorMessage(error: unknown): string {
     return "Browser preview could not fetch this source. Run the Tauri desktop app for unrestricted source searching.";
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+function parserModeForSource(source: SourceConfig): ParserMode {
+  if (source.parserMode === "static" || source.parserMode === "webview" || source.parserMode === "hybrid" || source.parserMode === "fallbackOnly") {
+    return source.parserMode;
+  }
+  if (source.sourceType === "webviewOnly") {
+    return "fallbackOnly";
+  }
+  return source.requiresJavaScript ? "hybrid" : "static";
+}
+
+function qualityForScore(
+  score: number,
+  resolution: "exact" | "parsed" | "fallback"
+): NonNullable<SearchResult["quality"]> {
+  if (resolution === "fallback") {
+    return "weak";
+  }
+  if (score >= 92) {
+    return "excellent";
+  }
+  if (score >= 85) {
+    return "good";
+  }
+  if (score >= 70) {
+    return "medium";
+  }
+  return "weak";
+}
+
+function sourceReliability(source: SourceConfig): number {
+  const parserMode = parserModeForSource(source);
+  let score = 50;
+  if (source.isDefault) {
+    score += 12;
+  }
+  if (source.resultSelector.trim()) {
+    score += 10;
+  }
+  if (parserMode === "hybrid") {
+    score += 12;
+  }
+  if (parserMode === "static" || parserMode === "webview") {
+    score += 6;
+  }
+  if (parserMode === "fallbackOnly" || source.resultOpenBehavior === "search_page") {
+    score -= 25;
+  }
+  if (source.userModified) {
+    score += 3;
+  }
+  return Math.max(0, Math.min(100, score));
+}
+
+function compareOutcomes(left: SourceSearchOutcome, right: SourceSearchOutcome): number {
+  const leftBest = bestOutcomeSortTuple(left);
+  const rightBest = bestOutcomeSortTuple(right);
+  return (
+    rightBest.qualityRank - leftBest.qualityRank ||
+    rightBest.score - leftBest.score ||
+    rightBest.reliability - leftBest.reliability ||
+    left.sourceName.localeCompare(right.sourceName)
+  );
+}
+
+function bestOutcomeSortTuple(outcome: SourceSearchOutcome): {
+  qualityRank: number;
+  score: number;
+  reliability: number;
+} {
+  const best = outcome.results[0];
+  return {
+    qualityRank: qualityRank(best?.quality || best?.rawData?.quality || (outcome.status === "error" ? "failed" : "weak")),
+    score: best?.confidence ?? 0,
+    reliability: best?.sourceReliability ?? 0
+  };
+}
+
+function qualityRank(value?: string | null): number {
+  switch (value) {
+    case "excellent":
+      return 5;
+    case "good":
+      return 4;
+    case "medium":
+      return 3;
+    case "weak":
+      return 2;
+    case "failed":
+      return 1;
+    default:
+      return 0;
+  }
 }
 
 function wait(ms: number): Promise<void> {

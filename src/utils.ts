@@ -73,6 +73,7 @@ export function normalizeSource(source: SourceConfig): SourceConfig {
     resultOpenBehavior: source.resultOpenBehavior || "result_page",
     ambiguousQueryBehavior: source.ambiguousQueryBehavior || "show_choices",
     sourceKind: source.sourceKind === "direct" ? "direct" : "web",
+    parserMode: normalizeParserMode(source.parserMode, source.sourceType, source.requiresJavaScript),
     baseUrl: source.baseUrl.trim(),
     searchUrl: source.searchUrl.trim(),
     method: (source.method || "GET").trim().toUpperCase(),
@@ -246,4 +247,23 @@ function defaultWatchPatterns(): string[] {
     "смотреть",
     "смотреть онлайн"
   ];
+}
+
+function normalizeParserMode(
+  value: SourceConfig["parserMode"],
+  sourceType: SourceConfig["sourceType"],
+  requiresJavaScript: boolean
+): NonNullable<SourceConfig["parserMode"]> {
+  if (
+    value === "static" ||
+    value === "webview" ||
+    value === "hybrid" ||
+    value === "fallbackOnly"
+  ) {
+    return value;
+  }
+  if (sourceType === "webviewOnly") {
+    return "fallbackOnly";
+  }
+  return requiresJavaScript ? "hybrid" : "static";
 }

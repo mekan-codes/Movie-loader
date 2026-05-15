@@ -60,6 +60,8 @@ struct SourceConfig {
     result_open_behavior: String,
     #[serde(default = "default_ambiguous_query_behavior")]
     ambiguous_query_behavior: String,
+    #[serde(default = "default_parser_mode")]
+    parser_mode: String,
     base_url: String,
     search_url: String,
     #[serde(default = "default_method")]
@@ -158,6 +160,14 @@ struct SearchResult {
     year: Option<String>,
     description: Option<String>,
     confidence: f64,
+    #[serde(default)]
+    quality: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    source_reliability: Option<f64>,
+    #[serde(default)]
+    debug_info: Option<SourceDebugInfo>,
     raw_data: HashMap<String, String>,
 }
 
@@ -170,6 +180,28 @@ struct SourceSearchOutcome {
     message: Option<String>,
     elapsed_ms: u128,
     results: Vec<SearchResult>,
+    debug_info: Option<SourceDebugInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SourceDebugInfo {
+    generated_search_url: Option<String>,
+    final_loaded_url: Option<String>,
+    parser_mode_used: Option<String>,
+    static_fetch_worked: Option<bool>,
+    static_parse_worked: Option<bool>,
+    web_view_parse_worked: Option<bool>,
+    html_length: Option<usize>,
+    result_container_count: Option<usize>,
+    candidate_titles: Vec<String>,
+    candidate_links: Vec<String>,
+    best_score: Option<f64>,
+    why_auto_open_failed: Option<String>,
+    javascript_probably_required: Option<bool>,
+    browser_preview_limited: Option<bool>,
+    timeout_or_error: Option<String>,
+    final_action: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -189,6 +221,7 @@ struct SourceTestResult {
     query_specificity: Option<String>,
     ambiguous: bool,
     detected_selectors: Vec<SelectorCandidate>,
+    debug_info: Option<SourceDebugInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -281,6 +314,33 @@ struct ViewerResolveProbe {
     url: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebviewParsePayload {
+    final_url: String,
+    html_length: usize,
+    results: Vec<WebviewCandidatePayload>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebviewCandidatePayload {
+    title: String,
+    url: String,
+    year: Option<String>,
+    poster_url: Option<String>,
+    description: Option<String>,
+    result_selector: Option<String>,
+    result_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct WebviewParsedResults {
+    final_url: String,
+    html_length: usize,
+    results: Vec<SearchResult>,
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -307,6 +367,10 @@ fn default_result_open_behavior() -> String {
 
 fn default_ambiguous_query_behavior() -> String {
     "show_choices".to_string()
+}
+
+fn default_parser_mode() -> String {
+    "hybrid".to_string()
 }
 
 fn default_true() -> bool {
@@ -399,6 +463,14 @@ fn save_source(
     state: State<'_, AppState>,
     source: SourceConfig,
 ) -> Result<SourceConfig, String> {
+    let source = SourceConfig {
+        user_modified: if source.is_default || source.default_source_id.is_some() {
+            true
+        } else {
+            source.user_modified
+        },
+        ..source
+    };
     validate_source(&source)?;
     let conn = state.db.lock().map_err(|_| "Database lock failed".to_string())?;
     save_source_to_db(&conn, source)
@@ -524,6 +596,7 @@ async fn test_source(source: SourceConfig, query: Option<String>) -> Result<Sour
 
 #[tauri::command]
 async fn search_sources(
+    window: tauri::Window,
     state: State<'_, AppState>,
     query: String,
     source_ids: Option<Vec<String>>,
@@ -561,8 +634,10 @@ async fn search_sources(
 
     let tasks = searchable_sources
         .into_iter()
-        .map(|source| search_single_source(source, trimmed_query.clone()));
-    Ok(join_all(tasks).await)
+        .map(|source| search_single_source(window.clone(), source, trimmed_query.clone()));
+    let mut outcomes = join_all(tasks).await;
+    outcomes.sort_by(compare_outcomes);
+    Ok(outcomes)
 }
 
 #[tauri::command]
@@ -1072,6 +1147,258 @@ async fn eval_webview_json(
         .map_err(|_| "Viewer inspection callback was cancelled.".to_string())
 }
 
+async fn parse_search_with_webview(
+    window: &tauri::Window,
+    source: &SourceConfig,
+    query: &str,
+    search_url: &str,
+) -> Result<WebviewParsedResults, String> {
+    let parsed = parse_external_http_url(search_url)?;
+    let label = format!("cinefinder-search-{}-{}", source.id, stable_id(search_url));
+    let app = window.app_handle().clone();
+    close_viewer_by_label(&app, &label);
+
+    let builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(parsed))
+        .initialization_script_for_all_frames(viewer_initialization_script())
+        .on_new_window(|_, _| NewWindowResponse::Deny);
+
+    let webview = window
+        .add_child(
+            builder,
+            tauri::LogicalPosition::new(-32000.0, -32000.0),
+            tauri::LogicalSize::new(1.0, 1.0),
+        )
+        .map_err(|error| format!("Could not open WebView parser: {error}"))?;
+    let _ = webview.hide();
+
+    wait_for_viewer_ready(&webview, source_timeout_ms(source)).await;
+    if source.load_delay_ms > 0 {
+        sleep(Duration::from_millis(source.load_delay_ms.min(10_000))).await;
+    }
+
+    let script = webview_search_parse_script(source)?;
+    let value = eval_webview_json(&webview, script, source_timeout_ms(source)).await;
+    let _ = webview.close();
+
+    let payload = serde_json::from_str::<WebviewParsePayload>(&value?)
+        .map_err(|error| format!("Could not parse rendered search results: {error}"))?;
+
+    let mut seen = HashSet::new();
+    let mut results = payload
+        .results
+        .into_iter()
+        .filter_map(|candidate| {
+            if candidate.title.trim().is_empty() || candidate.url.trim().is_empty() {
+                return None;
+            }
+            let dedupe_key = format!(
+                "{}:{}:{}",
+                source.id,
+                normalize_match_key(&candidate.title),
+                candidate.year.clone().unwrap_or_default()
+            );
+            if !seen.insert(dedupe_key) {
+                return None;
+            }
+            let scored = score_result_candidate(query, &candidate.title, candidate.year.as_deref());
+            if scored.score < 12.0 {
+                return None;
+            }
+            let quality = quality_for_score(scored.score, "parsed");
+            let mut raw_data = HashMap::new();
+            raw_data.insert("provider".to_string(), "rendered-webview".to_string());
+            raw_data.insert("resultIndex".to_string(), candidate.result_index.to_string());
+            if let Some(selector) = candidate.result_selector {
+                raw_data.insert("resultSelector".to_string(), selector);
+            }
+            raw_data.insert("confidenceReason".to_string(), scored.reason.clone());
+            raw_data.insert("quality".to_string(), quality.clone());
+            Some(SearchResult {
+                id: stable_id(&format!("{}:{}", source.id, candidate.url)),
+                source_id: source.id.clone(),
+                source_name: source.name.clone(),
+                title: candidate.title,
+                url: candidate.url,
+                open_mode: Some("webview".to_string()),
+                playable_url: None,
+                poster_url: candidate.poster_url,
+                year: candidate.year,
+                description: candidate.description,
+                confidence: scored.score,
+                quality: Some(quality),
+                reason: Some(scored.reason),
+                source_reliability: Some(source_reliability(source)),
+                debug_info: None,
+                raw_data,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    results.sort_by(|left, right| {
+        right
+            .confidence
+            .partial_cmp(&left.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(24);
+
+    Ok(WebviewParsedResults {
+        final_url: payload.final_url,
+        html_length: payload.html_length,
+        results,
+    })
+}
+
+fn webview_search_parse_script(source: &SourceConfig) -> Result<String, String> {
+    let result_selectors = if source.result_selector.trim().is_empty() {
+        common_result_selectors()
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+    } else {
+        vec![source.result_selector.trim().to_string()]
+    };
+    let title_selectors = source
+        .title_selector
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| vec![value.trim().to_string()])
+        .unwrap_or_else(|| common_title_selectors().iter().map(|value| value.to_string()).collect());
+    let link_selectors = source
+        .link_selector
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| vec![value.trim().to_string()])
+        .unwrap_or_else(|| common_link_selectors().iter().map(|value| value.to_string()).collect());
+    let poster_selectors = source
+        .poster_selector
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| vec![value.trim().to_string()])
+        .unwrap_or_else(|| common_poster_selectors().iter().map(|value| value.to_string()).collect());
+    let year_selectors = source
+        .year_selector
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| vec![value.trim().to_string()])
+        .unwrap_or_else(|| common_year_selectors().iter().map(|value| value.to_string()).collect());
+    let description_selector = source.description_selector.clone().unwrap_or_default();
+    let link_attribute = source
+        .link_attribute
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "href".to_string());
+    let poster_attribute = source
+        .poster_attribute
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "src".to_string());
+
+    let result_selectors_json = serde_json::to_string(&result_selectors)
+        .map_err(|error| format!("Could not serialize result selectors: {error}"))?;
+    let title_selectors_json = serde_json::to_string(&title_selectors)
+        .map_err(|error| format!("Could not serialize title selectors: {error}"))?;
+    let link_selectors_json = serde_json::to_string(&link_selectors)
+        .map_err(|error| format!("Could not serialize link selectors: {error}"))?;
+    let poster_selectors_json = serde_json::to_string(&poster_selectors)
+        .map_err(|error| format!("Could not serialize poster selectors: {error}"))?;
+    let year_selectors_json = serde_json::to_string(&year_selectors)
+        .map_err(|error| format!("Could not serialize year selectors: {error}"))?;
+    let description_selector_json = serde_json::to_string(&description_selector)
+        .map_err(|error| format!("Could not serialize description selector: {error}"))?;
+    let link_attribute_json = serde_json::to_string(&link_attribute)
+        .map_err(|error| format!("Could not serialize link attribute: {error}"))?;
+    let poster_attribute_json = serde_json::to_string(&poster_attribute)
+        .map_err(|error| format!("Could not serialize poster attribute: {error}"))?;
+
+    Ok(format!(
+        r#"
+(() => {{
+  const resultSelectors = {result_selectors_json};
+  const titleSelectors = {title_selectors_json};
+  const linkSelectors = {link_selectors_json};
+  const posterSelectors = {poster_selectors_json};
+  const yearSelectors = {year_selectors_json};
+  const descriptionSelector = {description_selector_json};
+  const linkAttribute = {link_attribute_json};
+  const posterAttribute = {poster_attribute_json};
+  const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const safeAll = (root, selector) => {{
+    if (!selector || !String(selector).trim()) return [];
+    try {{ return Array.from((root || document).querySelectorAll(selector)); }} catch (_) {{ return []; }}
+  }};
+  const firstMatching = (root, selectors) => {{
+    for (const selector of selectors) {{
+      try {{
+        if (root.matches && root.matches(selector)) return root;
+        const found = root.querySelector(selector);
+        if (found) return found;
+      }} catch (_) {{}}
+    }}
+    return null;
+  }};
+  const readAttr = (element, attr) => element ? clean(element.getAttribute(attr)) : "";
+  const readAnyImageAttr = (element) => {{
+    if (!element) return "";
+    return readAttr(element, posterAttribute) || readAttr(element, "src") || readAttr(element, "data-src") ||
+      readAttr(element, "data-original") || readAttr(element, "data-lazy-src");
+  }};
+  const textOf = (element) => clean(
+    readAttr(element, "title") ||
+    readAttr(element, "aria-label") ||
+    readAttr(element, "alt") ||
+    readAttr(element?.querySelector?.("img"), "alt") ||
+    element?.textContent ||
+    ""
+  );
+  const absoluteUrl = (value) => {{
+    const raw = clean(value);
+    if (!raw || raw.startsWith("javascript:") || raw.startsWith("mailto:") || raw.startsWith('#')) return null;
+    try {{ return new URL(raw, window.location.href).toString(); }} catch (_) {{ return null; }}
+  }};
+  const extractYear = (value) => {{
+    const match = String(value || "").match(/\b(19|20)\d{{2}}\b/);
+    return match ? match[0] : null;
+  }};
+  const results = [];
+  const seen = new Set();
+  for (const resultSelector of resultSelectors) {{
+    const cards = safeAll(document, resultSelector).slice(0, 100);
+    cards.forEach((card, index) => {{
+      const linkElement = firstMatching(card, linkSelectors) || (card.matches?.("a[href]") ? card : null);
+      const url = absoluteUrl(readAttr(linkElement, linkAttribute) || readAttr(linkElement, "href"));
+      if (!url) return;
+      const titleElement = firstMatching(card, titleSelectors);
+      const title = textOf(titleElement) || textOf(linkElement) || textOf(firstMatching(card, ["img"])) || textOf(card) || url;
+      const yearElement = firstMatching(card, yearSelectors);
+      const year = textOf(yearElement) || extractYear(`${{title}} ${{card.textContent || ""}}`);
+      const posterElement = firstMatching(card, posterSelectors);
+      const posterUrl = absoluteUrl(readAnyImageAttr(posterElement));
+      const description = descriptionSelector ? textOf(firstMatching(card, [descriptionSelector])) : "";
+      const key = `${{title.toLowerCase()}}|${{year || ""}}|${{url}}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      results.push({{
+        title,
+        url,
+        year,
+        posterUrl,
+        description,
+        resultSelector,
+        resultIndex: index
+      }});
+    }});
+  }}
+  return {{
+    finalUrl: window.location.href,
+    htmlLength: document.documentElement.outerHTML.length,
+    results: results.slice(0, 80)
+  }};
+}})()
+"#
+    ))
+}
+
 fn viewer_probe_script(source: &SourceConfig) -> Result<String, String> {
     let watch_selector = source.watch_button_selector.clone().unwrap_or_default();
     let player_selector = source
@@ -1104,7 +1431,7 @@ fn viewer_probe_script(source: &SourceConfig) -> Result<String, String> {
   const normalize = (value) => String(value || "")
     .toLowerCase()
     .replace(/[^\p{{L}}\p{{N}}]+/gu, " ")
-    .replace(/\b(full|movie|watch|online|hd|free|season|episode|ep|show|film|смотреть)\b/gu, " ")
+    .replace(/\b(full|movie|watch|online|hd|free|season|episode|ep|show|film|смотреть|онлайн)\b/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
   const visible = (element) => {{
@@ -1173,8 +1500,23 @@ fn viewer_initialization_script() -> String {
     return null;
   };
   window.open = openInPlace;
+  const forceSameViewer = (root = document) => {
+    try {
+      root.querySelectorAll?.("a[target], form[target]").forEach((element) => {
+        element.setAttribute("target", "_self");
+      });
+    } catch (_) {}
+  };
+  forceSameViewer();
+  new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      mutation.addedNodes.forEach((node) => {
+        if (node.nodeType === 1) forceSameViewer(node);
+      });
+    }
+  }).observe(document.documentElement, { childList: true, subtree: true });
   document.addEventListener("click", (event) => {
-    const target = event.target && event.target.closest ? event.target.closest("a[target='_blank'], a[target='blank']") : null;
+    const target = event.target && event.target.closest ? event.target.closest("a[target], area[target]") : null;
     if (target && target.href) {
       event.preventDefault();
       openInPlace(target.href);
@@ -1390,6 +1732,7 @@ fn save_source_to_db(
         source_open_behavior: normalized_source_open_behavior(&source.source_open_behavior),
         result_open_behavior: normalized_result_open_behavior(&source.result_open_behavior),
         ambiguous_query_behavior: normalized_ambiguous_query_behavior(&source.ambiguous_query_behavior),
+        parser_mode: normalized_parser_mode(&source.parser_mode, &source.source_type, source.requires_javascript),
         base_url: source.base_url.trim().to_string(),
         search_url: source.search_url.trim().to_string(),
         method: source.method.trim().to_uppercase(),
@@ -1593,58 +1936,93 @@ fn read_deleted_default_source_ids(conn: &Connection) -> Result<HashSet<String>,
         .map_err(|error| format!("Could not collect deleted default sources: {error}"))
 }
 
-async fn search_single_source(source: SourceConfig, query: String) -> SourceSearchOutcome {
+async fn search_single_source(
+    window: tauri::Window,
+    source: SourceConfig,
+    query: String,
+) -> SourceSearchOutcome {
     let started = Instant::now();
+    let search_url = build_search_url(&source, &query);
+    let parser_mode = normalized_parser_mode(
+        &source.parser_mode,
+        &source.source_type,
+        source.requires_javascript,
+    );
+    let mut debug_info = SourceDebugInfo {
+        generated_search_url: Some(search_url.clone()),
+        final_loaded_url: Some(search_url.clone()),
+        parser_mode_used: Some(parser_mode.clone()),
+        javascript_probably_required: Some(source.requires_javascript),
+        browser_preview_limited: Some(false),
+        ..SourceDebugInfo::default()
+    };
 
-    if source.source_type == "webviewOnly" {
-        let url = build_search_url(&source, &query);
-        return outcome(
+    if source.source_type == "webviewOnly" || parser_mode == "fallbackOnly" {
+        debug_info.final_action = Some("search fallback".to_string());
+        debug_info.why_auto_open_failed =
+            Some("Source is configured for fallback-only/WebView search.".to_string());
+        return outcome_with_debug(
             &source,
             "ready",
             Some("WebView-only source. Open source search page.".to_string()),
             started,
-            vec![webview_result(&source, &query, &url)],
+            vec![webview_result(&source, &query, &search_url)],
+            debug_info,
         );
     }
     if source.result_open_behavior == "search_page" {
-        let url = build_search_url(&source, &query);
-        return outcome(
+        debug_info.final_action = Some("search fallback".to_string());
+        debug_info.why_auto_open_failed =
+            Some("Source is configured to open the search page.".to_string());
+        return outcome_with_debug(
             &source,
             "ready",
             Some("Configured to open the source search page.".to_string()),
             started,
-            vec![webview_result(&source, &query, &url)],
+            vec![webview_result(&source, &query, &search_url)],
+            debug_info,
         );
     }
 
     if let Err(error) = validate_source(&source) {
-        return outcome(&source, "error", Some(error), started, Vec::new());
+        debug_info.final_action = Some("failed".to_string());
+        debug_info.timeout_or_error = Some(error.clone());
+        return outcome_with_debug(&source, "error", Some(error), started, Vec::new(), debug_info);
     }
 
     if source.method.to_uppercase() != "GET" {
-        return outcome(
+        debug_info.final_action = Some("failed".to_string());
+        debug_info.timeout_or_error = Some("Only GET source searches are supported.".to_string());
+        return outcome_with_debug(
             &source,
             "error",
             Some("Only GET source searches are supported in v1.".to_string()),
             started,
             Vec::new(),
+            debug_info,
         );
     }
 
-    let search_url = build_search_url(&source, &query);
     if source.source_type == "directPage" {
-        return outcome(
+        debug_info.final_action = Some("exact page".to_string());
+        debug_info.best_score = Some(100.0);
+        return outcome_with_debug(
             &source,
             "found",
             Some("Direct page source. Opening configured page.".to_string()),
             started,
             vec![direct_page_result(&source, &query, &search_url)],
+            debug_info,
         );
     }
 
     let headers = match build_headers(&source.headers) {
         Ok(headers) => headers,
-        Err(error) => return outcome(&source, "error", Some(error), started, Vec::new()),
+        Err(error) => {
+            debug_info.final_action = Some("failed".to_string());
+            debug_info.timeout_or_error = Some(error.clone());
+            return outcome_with_debug(&source, "error", Some(error), started, Vec::new(), debug_info);
+        }
     };
 
     let client = match reqwest::Client::builder()
@@ -1654,69 +2032,155 @@ async fn search_single_source(source: SourceConfig, query: String) -> SourceSear
     {
         Ok(client) => client,
         Err(error) => {
-            return outcome(
+            let message = format!("Could not create HTTP client: {error}");
+            debug_info.final_action = Some("failed".to_string());
+            debug_info.timeout_or_error = Some(message.clone());
+            return outcome_with_debug(
                 &source,
                 "error",
-                Some(format!("Could not create HTTP client: {error}")),
+                Some(message),
                 started,
                 Vec::new(),
+                debug_info,
             )
         }
     };
 
-    let html = match fetch_search_html_with_retries(&client, &headers, &source, &search_url).await {
-        Ok(html) => html,
-        Err(FetchFailure::TimedOut(message)) => {
-            return outcome(&source, "timed_out", Some(message), started, Vec::new())
+    let mut candidates = Vec::new();
+    let mut static_error: Option<String> = None;
+    if parser_mode != "webview" {
+        match fetch_search_html_with_retries(&client, &headers, &source, &search_url).await {
+            Ok(html) => {
+                debug_info.static_fetch_worked = Some(true);
+                debug_info.html_length = Some(html.len());
+                match parse_results(&source, &query, &search_url, &html) {
+                    Ok(parsed) => {
+                        debug_info.static_parse_worked = Some(!parsed.is_empty());
+                        update_debug_candidates(&mut debug_info, &parsed);
+                        candidates = parsed;
+                    }
+                    Err(error) => {
+                        debug_info.static_parse_worked = Some(false);
+                        debug_info.timeout_or_error = Some(error.clone());
+                        static_error = Some(error);
+                    }
+                }
+            }
+            Err(FetchFailure::TimedOut(message)) => {
+                debug_info.static_fetch_worked = Some(false);
+                debug_info.timeout_or_error = Some(message.clone());
+                static_error = Some(message);
+            }
+            Err(FetchFailure::SelectorMissing(message)) => {
+                debug_info.static_fetch_worked = Some(true);
+                debug_info.static_parse_worked = Some(false);
+                debug_info.why_auto_open_failed = Some(message.clone());
+                static_error = Some(message);
+            }
+            Err(FetchFailure::Failed(message)) => {
+                debug_info.static_fetch_worked = Some(false);
+                debug_info.timeout_or_error = Some(message.clone());
+                static_error = Some(message);
+            }
         }
-        Err(FetchFailure::SelectorMissing(message)) => {
-            return outcome(
+    }
+
+    if parser_mode == "webview" || (parser_mode == "hybrid" && candidates.is_empty()) {
+        match parse_search_with_webview(&window, &source, &query, &search_url).await {
+            Ok(rendered) => {
+                debug_info.web_view_parse_worked = Some(!rendered.results.is_empty());
+                debug_info.final_loaded_url = Some(rendered.final_url);
+                if debug_info.html_length.unwrap_or(0) < rendered.html_length {
+                    debug_info.html_length = Some(rendered.html_length);
+                }
+                if !rendered.results.is_empty() {
+                    update_debug_candidates(&mut debug_info, &rendered.results);
+                    candidates = rendered.results;
+                }
+            }
+            Err(error) => {
+                debug_info.web_view_parse_worked = Some(false);
+                debug_info.timeout_or_error = Some(error.clone());
+                if static_error.is_none() {
+                    static_error = Some(error);
+                }
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        let message = static_error
+            .clone()
+            .unwrap_or_else(|| "No parsed results. Open source search page.".to_string());
+        debug_info.final_action = Some(if parser_mode == "static" && debug_info.static_fetch_worked == Some(false) {
+            "failed".to_string()
+        } else {
+            "search fallback".to_string()
+        });
+        debug_info.why_auto_open_failed =
+            Some("No result candidates matched the configured or common selectors.".to_string());
+        if parser_mode == "static" && debug_info.static_fetch_worked == Some(false) {
+            return outcome_with_debug(
                 &source,
-                "ready",
-                Some(format!("{message} Open source search page.")),
+                "error",
+                Some(message),
                 started,
-                vec![webview_result(&source, &query, &search_url)],
-            )
+                Vec::new(),
+                debug_info,
+            );
         }
-        Err(FetchFailure::Failed(message)) => {
-            return outcome(&source, "error", Some(message), started, Vec::new())
-        }
-    };
+        return outcome_with_debug(
+            &source,
+            "ready",
+            Some(format!("{message} Open source search page.")),
+            started,
+            vec![webview_result(&source, &query, &search_url)],
+            debug_info,
+        );
+    }
 
-    match parse_results(&source, &query, &search_url, &html) {
-        Ok(candidates) => {
-            let decision = decide_resolution(&source, &query, candidates);
-            if decision.fallback_to_search || decision.results.is_empty() {
-                return outcome(
-                    &source,
-                    "ready",
-                    Some(decision.reason),
-                    started,
-                    vec![webview_result(&source, &query, &search_url)],
-                );
-            }
-            let results =
-                resolve_playable_results(&client, &headers, &source, &search_url, decision.results)
-                    .await;
-            if results.is_empty() {
-                outcome(
-                    &source,
-                    "ready",
-                    Some("No parsed results. Open source search page.".to_string()),
-                    started,
-                    vec![webview_result(&source, &query, &search_url)],
-                )
-            } else {
-                outcome(
-                    &source,
-                    "found",
-                    Some(decision.reason),
-                    started,
-                    results,
-                )
-            }
-        }
-        Err(error) => outcome(&source, "error", Some(error), started, Vec::new()),
+    let decision = decide_resolution(&source, &query, candidates);
+    if decision.fallback_to_search || decision.results.is_empty() {
+        debug_info.final_action = Some("search fallback".to_string());
+        debug_info.why_auto_open_failed = Some(decision.reason.clone());
+        return outcome_with_debug(
+            &source,
+            "ready",
+            Some(decision.reason),
+            started,
+            vec![webview_result(&source, &query, &search_url)],
+            debug_info,
+        );
+    }
+
+    let results =
+        resolve_playable_results(&client, &headers, &source, &search_url, decision.results).await;
+    if results.is_empty() {
+        debug_info.final_action = Some("search fallback".to_string());
+        debug_info.why_auto_open_failed =
+            Some("Parsed results were empty after target resolution.".to_string());
+        outcome_with_debug(
+            &source,
+            "ready",
+            Some("No parsed results. Open source search page.".to_string()),
+            started,
+            vec![webview_result(&source, &query, &search_url)],
+            debug_info,
+        )
+    } else {
+        debug_info.final_action = Some(if decision.ambiguous {
+            "show choices".to_string()
+        } else {
+            "exact page".to_string()
+        });
+        outcome_with_debug(
+            &source,
+            "found",
+            Some(decision.reason),
+            started,
+            results,
+            debug_info,
+        )
     }
 }
 
@@ -1748,6 +2212,7 @@ async fn test_direct_source(
             query_specificity: None,
             ambiguous: false,
             detected_selectors: Vec::new(),
+            debug_info: None,
         };
     }
     if source.result_open_behavior == "search_page" {
@@ -1772,6 +2237,7 @@ async fn test_direct_source(
             query_specificity: None,
             ambiguous: false,
             detected_selectors: Vec::new(),
+            debug_info: None,
         };
     }
     if source.source_type == "directPage" {
@@ -1802,6 +2268,7 @@ async fn test_direct_source(
             query_specificity: Some("Direct page source.".to_string()),
             ambiguous: false,
             detected_selectors: Vec::new(),
+            debug_info: None,
         };
     }
     let headers = match build_headers(&source.headers) {
@@ -1822,6 +2289,7 @@ async fn test_direct_source(
                 query_specificity: None,
                 ambiguous: false,
                 detected_selectors: Vec::new(),
+                debug_info: None,
             }
         }
     };
@@ -1848,6 +2316,7 @@ async fn test_direct_source(
                 query_specificity: None,
                 ambiguous: false,
                 detected_selectors: Vec::new(),
+                debug_info: None,
             }
         }
     };
@@ -1924,13 +2393,56 @@ async fn test_direct_source(
                 final_search_url: Some(final_search_url.clone()),
                 raw_status: Some("loaded".to_string()),
                 selector_match_count,
-                preview_results,
+                preview_results: preview_results.clone(),
                 fallback_used: decision.fallback_to_search || parsed_count == 0,
                 final_open_url,
                 best_match,
                 query_specificity: Some(decision.query_specificity),
                 ambiguous: decision.ambiguous,
                 detected_selectors,
+                debug_info: Some({
+                    let mut debug = SourceDebugInfo {
+                        generated_search_url: Some(final_search_url.clone()),
+                        final_loaded_url: Some(final_search_url.clone()),
+                        parser_mode_used: Some(normalized_parser_mode(
+                            &source.parser_mode,
+                            &source.source_type,
+                            source.requires_javascript,
+                        )),
+                        static_fetch_worked: Some(true),
+                        static_parse_worked: Some(parsed_count > 0),
+                        web_view_parse_worked: None,
+                        html_length: Some(html.len()),
+                        javascript_probably_required: Some(source.requires_javascript),
+                        final_action: Some(if decision.fallback_to_search {
+                            "search fallback".to_string()
+                        } else if decision.ambiguous {
+                            "show choices".to_string()
+                        } else {
+                            "exact page".to_string()
+                        }),
+                        ..SourceDebugInfo::default()
+                    };
+                    if decision.fallback_to_search {
+                        debug.why_auto_open_failed = Some(decision.reason.clone());
+                    }
+                    debug.result_container_count = Some(parsed_count);
+                    debug.candidate_titles = preview_results
+                        .iter()
+                        .take(5)
+                        .map(|result| result.title.clone())
+                        .collect();
+                    debug.candidate_links = preview_results
+                        .iter()
+                        .take(5)
+                        .map(|result| result.url.clone())
+                        .collect();
+                    debug.best_score = preview_results
+                        .iter()
+                        .filter_map(|result| result.score)
+                        .next();
+                    debug
+                }),
             }
         }
         Err(FetchFailure::TimedOut(message)) => SourceTestResult {
@@ -1948,6 +2460,7 @@ async fn test_direct_source(
             query_specificity: None,
             ambiguous: false,
             detected_selectors: Vec::new(),
+            debug_info: None,
         },
         Err(FetchFailure::SelectorMissing(message)) => SourceTestResult {
             ok: false,
@@ -1964,6 +2477,7 @@ async fn test_direct_source(
             query_specificity: None,
             ambiguous: false,
             detected_selectors: Vec::new(),
+            debug_info: None,
         },
         Err(FetchFailure::Failed(message)) => SourceTestResult {
             ok: false,
@@ -1980,6 +2494,7 @@ async fn test_direct_source(
             query_specificity: None,
             ambiguous: false,
             detected_selectors: Vec::new(),
+            debug_info: None,
         },
     }
 }
@@ -2385,8 +2900,8 @@ fn parse_results_with_selector(
             .filter(|value| !value.is_empty());
         let poster_url = poster_selector
             .as_ref()
-            .and_then(|selector| first_attr(node, selector, poster_attribute))
-            .or_else(|| first_attr_any(node, common_poster_selectors(), poster_attribute))
+            .and_then(|selector| first_poster_attr(node, selector, poster_attribute))
+            .or_else(|| first_poster_attr_any(node, common_poster_selectors(), poster_attribute))
             .and_then(|value| absolutize_url(&source.base_url, search_url, &value));
         let playable_url = video_selector
             .as_ref()
@@ -2417,6 +2932,7 @@ fn parse_results_with_selector(
 
         let scored = score_result_candidate(query, &title, year.as_deref());
         let confidence = scored.score;
+        let quality = quality_for_score(confidence, "parsed");
         results.push(SearchResult {
             id: format!("{}-{index}", source.id),
             source_id: source.id.clone(),
@@ -2433,8 +2949,13 @@ fn parse_results_with_selector(
             year,
             description,
             confidence,
+            quality: Some(quality.clone()),
+            reason: Some(scored.reason.clone()),
+            source_reliability: Some(source_reliability(source)),
+            debug_info: None,
             raw_data: {
                 raw_data.insert("confidenceReason".to_string(), scored.reason);
+                raw_data.insert("quality".to_string(), quality);
                 raw_data
             },
         });
@@ -2470,9 +2991,13 @@ fn decide_resolution(
         .map(|mut candidate| {
             let scored = score_result_candidate(query, &candidate.title, candidate.year.as_deref());
             candidate.confidence = scored.score;
+            let quality = quality_for_score(scored.score, "parsed");
+            candidate.quality = Some(quality.clone());
+            candidate.reason = Some(scored.reason.clone());
             candidate
                 .raw_data
                 .insert("confidenceReason".to_string(), scored.reason);
+            candidate.raw_data.insert("quality".to_string(), quality);
             candidate
         })
         .filter(|candidate| candidate.confidence >= 35.0)
@@ -2534,9 +3059,12 @@ fn decide_resolution(
                 result
                     .raw_data
                     .insert("resolution".to_string(), "ambiguous".to_string());
+                result.raw_data.insert("quality".to_string(), "medium".to_string());
                 result
                     .raw_data
                     .insert("querySpecificity".to_string(), specificity.reason.clone());
+                result.quality = Some("medium".to_string());
+                result.reason = Some("Multiple possible matches".to_string());
                 result
             })
             .collect::<Vec<_>>();
@@ -2558,9 +3086,15 @@ fn decide_resolution(
     selected
         .raw_data
         .insert("resolution".to_string(), "exact".to_string());
+    let selected_quality = quality_for_score(selected.confidence, "exact");
+    selected
+        .raw_data
+        .insert("quality".to_string(), selected_quality.clone());
     selected
         .raw_data
         .insert("querySpecificity".to_string(), specificity.reason.clone());
+    selected.quality = Some(selected_quality);
+    selected.reason = selected.raw_data.get("confidenceReason").cloned();
     ResolverDecision {
         fallback_to_search: false,
         reason: format!(
@@ -2636,13 +3170,22 @@ fn broad_franchise_queries() -> HashSet<&'static str> {
     ])
 }
 
-fn outcome(
+fn outcome_with_debug(
     source: &SourceConfig,
     status: &str,
     message: Option<String>,
     started: Instant,
-    results: Vec<SearchResult>,
+    mut results: Vec<SearchResult>,
+    debug_info: SourceDebugInfo,
 ) -> SourceSearchOutcome {
+    for result in &mut results {
+        result.debug_info = Some(debug_info.clone());
+        if result.raw_data.get("resolution").map(String::as_str) == Some("fallback") {
+            if let Ok(value) = serde_json::to_string(&debug_info) {
+                result.raw_data.insert("fallbackDebug".to_string(), value);
+            }
+        }
+    }
     SourceSearchOutcome {
         source_id: source.id.clone(),
         source_name: source.name.clone(),
@@ -2650,6 +3193,78 @@ fn outcome(
         message,
         elapsed_ms: started.elapsed().as_millis(),
         results,
+        debug_info: Some(debug_info),
+    }
+}
+
+fn update_debug_candidates(debug_info: &mut SourceDebugInfo, candidates: &[SearchResult]) {
+    debug_info.result_container_count = Some(candidates.len());
+    debug_info.candidate_titles = candidates
+        .iter()
+        .take(5)
+        .map(|candidate| candidate.title.clone())
+        .collect();
+    debug_info.candidate_links = candidates
+        .iter()
+        .take(5)
+        .map(|candidate| candidate.url.clone())
+        .collect();
+    debug_info.best_score = candidates.first().map(|candidate| candidate.confidence);
+}
+
+fn compare_outcomes(left: &SourceSearchOutcome, right: &SourceSearchOutcome) -> std::cmp::Ordering {
+    let left_tuple = outcome_sort_tuple(left);
+    let right_tuple = outcome_sort_tuple(right);
+    right_tuple
+        .0
+        .cmp(&left_tuple.0)
+        .then_with(|| {
+            right_tuple
+                .1
+                .partial_cmp(&left_tuple.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            right_tuple
+                .2
+                .partial_cmp(&left_tuple.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| left.source_name.cmp(&right.source_name))
+}
+
+fn outcome_sort_tuple(outcome: &SourceSearchOutcome) -> (i32, f64, f64) {
+    let Some(best) = outcome.results.first() else {
+        return (
+            if outcome.status == "error" || outcome.status == "timed_out" {
+                quality_rank("failed")
+            } else {
+                0
+            },
+            0.0,
+            0.0,
+        );
+    };
+    (
+        quality_rank(best.quality.as_deref().unwrap_or_else(|| {
+            best.raw_data
+                .get("quality")
+                .map(String::as_str)
+                .unwrap_or("weak")
+        })),
+        best.confidence,
+        best.source_reliability.unwrap_or(0.0),
+    )
+}
+
+fn quality_rank(value: &str) -> i32 {
+    match value {
+        "excellent" => 5,
+        "good" => 4,
+        "medium" => 3,
+        "weak" => 2,
+        "failed" => 1,
+        _ => 0,
     }
 }
 
@@ -2706,9 +3321,17 @@ fn build_search_url(source: &SourceConfig, query: &str) -> String {
     } else {
         source.search_url.trim()
     };
-    template
+    let raw = template
         .replace("{query}", &encoded_query)
-        .replace("{slug}", &slug_query)
+        .replace("{slug}", &slug_query);
+    if Url::parse(&raw).is_ok() {
+        return raw;
+    }
+    Url::parse(source.base_url.trim())
+        .ok()
+        .and_then(|base| base.join(&raw).ok())
+        .map(|url| url.to_string())
+        .unwrap_or(raw)
 }
 
 fn source_timeout_ms(source: &SourceConfig) -> u64 {
@@ -2721,6 +3344,8 @@ fn webview_result(source: &SourceConfig, query: &str, url: &str) -> SearchResult
     raw_data.insert("resultKind".to_string(), "provider".to_string());
     raw_data.insert("primary".to_string(), "true".to_string());
     raw_data.insert("resolution".to_string(), "fallback".to_string());
+    raw_data.insert("quality".to_string(), "weak".to_string());
+    raw_data.insert("confidenceReason".to_string(), "Search fallback".to_string());
 
     SearchResult {
         id: stable_id(&format!("{}:{url}", source.id)),
@@ -2733,7 +3358,11 @@ fn webview_result(source: &SourceConfig, query: &str, url: &str) -> SearchResult
         poster_url: None,
         year: None,
         description: Some("Opens this JavaScript-heavy source in the in-app viewer.".to_string()),
-        confidence: 100.0,
+        confidence: 0.0,
+        quality: Some("weak".to_string()),
+        reason: Some("Search fallback".to_string()),
+        source_reliability: Some(source_reliability(source)),
+        debug_info: None,
         raw_data,
     }
 }
@@ -2744,6 +3373,7 @@ fn direct_page_result(source: &SourceConfig, query: &str, url: &str) -> SearchRe
     raw_data.insert("resultKind".to_string(), "parsed".to_string());
     raw_data.insert("primary".to_string(), "true".to_string());
     raw_data.insert("resolution".to_string(), "exact".to_string());
+    raw_data.insert("quality".to_string(), "excellent".to_string());
     raw_data.insert("confidenceReason".to_string(), "Configured direct page.".to_string());
     let playable_url = if is_playable_video_url(url) {
         Some(url.to_string())
@@ -2771,8 +3401,50 @@ fn direct_page_result(source: &SourceConfig, query: &str, url: &str) -> SearchRe
         year: None,
         description: Some("Configured direct page. Opens inside CineFinder.".to_string()),
         confidence: 100.0,
+        quality: Some("excellent".to_string()),
+        reason: Some("Configured direct page.".to_string()),
+        source_reliability: Some(source_reliability(source)),
+        debug_info: None,
         raw_data,
     }
+}
+
+fn quality_for_score(score: f64, resolution: &str) -> String {
+    if resolution == "fallback" {
+        return "weak".to_string();
+    }
+    if score >= 92.0 {
+        "excellent".to_string()
+    } else if score >= 85.0 {
+        "good".to_string()
+    } else if score >= 70.0 {
+        "medium".to_string()
+    } else {
+        "weak".to_string()
+    }
+}
+
+fn source_reliability(source: &SourceConfig) -> f64 {
+    let mut score: f64 = 50.0;
+    if source.is_default {
+        score += 12.0;
+    }
+    if !source.result_selector.trim().is_empty() {
+        score += 10.0;
+    }
+    match normalized_parser_mode(&source.parser_mode, &source.source_type, source.requires_javascript).as_str() {
+        "hybrid" => score += 12.0,
+        "static" | "webview" => score += 6.0,
+        "fallbackOnly" => score -= 25.0,
+        _ => {}
+    }
+    if source.result_open_behavior == "search_page" {
+        score -= 25.0;
+    }
+    if source.user_modified {
+        score += 3.0;
+    }
+    score.clamp(0.0, 100.0)
 }
 
 fn selector_match_count(source: &SourceConfig, html: &str) -> Result<usize, String> {
@@ -2877,6 +3549,12 @@ fn common_result_selectors() -> &'static [&'static str] {
         ".poster",
         ".thumb",
         ".result",
+        ".ml-item",
+        ".flw-item",
+        ".film_list-wrap .flw-item",
+        ".content .item",
+        ".short",
+        ".b-content__inline_item",
         "a[href]",
     ]
 }
@@ -2892,6 +3570,8 @@ fn common_title_selectors() -> &'static [&'static str] {
         ".movie-title",
         ".film-title",
         ".entry-title",
+        ".b-content__inline_item-link",
+        ".short-title",
         "[title]",
         "img[alt]",
     ]
@@ -2906,11 +3586,21 @@ fn common_link_selectors() -> &'static [&'static str] {
         ".thumb a",
         "article a",
         ".card a",
+        ".b-content__inline_item-link",
+        ".short-title a",
     ]
 }
 
 fn common_poster_selectors() -> &'static [&'static str] {
-    &["img", ".poster img", ".thumb img", "picture img"]
+    &[
+        "img",
+        ".poster img",
+        ".thumb img",
+        "picture img",
+        "img[data-src]",
+        "img[data-original]",
+        "img[data-lazy-src]",
+    ]
 }
 
 fn common_year_selectors() -> &'static [&'static str] {
@@ -2948,6 +3638,41 @@ fn first_attr_any(parent: ElementRef<'_>, selectors: &[&str], attribute: &str) -
         Selector::parse(selector_text)
             .ok()
             .and_then(|selector| first_attr(parent, &selector, attribute))
+    })
+}
+
+fn first_poster_attr(
+    parent: ElementRef<'_>,
+    selector: &Selector,
+    preferred_attribute: &str,
+) -> Option<String> {
+    let attributes = [
+        preferred_attribute,
+        "src",
+        "data-src",
+        "data-original",
+        "data-lazy-src",
+    ];
+    parent.select(selector).next().and_then(|node| {
+        attributes.iter().find_map(|attribute| {
+            node.value()
+                .attr(attribute)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+    })
+}
+
+fn first_poster_attr_any(
+    parent: ElementRef<'_>,
+    selectors: &[&str],
+    preferred_attribute: &str,
+) -> Option<String> {
+    selectors.iter().find_map(|selector_text| {
+        Selector::parse(selector_text)
+            .ok()
+            .and_then(|selector| first_poster_attr(parent, &selector, preferred_attribute))
     })
 }
 
@@ -3199,6 +3924,18 @@ fn normalized_ambiguous_query_behavior(value: &str) -> String {
     }
 }
 
+fn normalized_parser_mode(value: &str, source_type: &str, requires_javascript: bool) -> String {
+    match value.trim() {
+        "static" => "static".to_string(),
+        "webview" => "webview".to_string(),
+        "hybrid" => "hybrid".to_string(),
+        "fallbackOnly" => "fallbackOnly".to_string(),
+        _ if source_type.trim() == "webviewOnly" => "fallbackOnly".to_string(),
+        _ if requires_javascript => "hybrid".to_string(),
+        _ => "static".to_string(),
+    }
+}
+
 fn normalize_watch_patterns(patterns: Vec<String>) -> Vec<String> {
     let normalized = patterns
         .into_iter()
@@ -3315,6 +4052,7 @@ fn create_default_source(
         source_open_behavior: "webview".to_string(),
         result_open_behavior: "result_page".to_string(),
         ambiguous_query_behavior: "show_choices".to_string(),
+        parser_mode: "hybrid".to_string(),
         base_url: base_url.to_string(),
         search_url: search_url.to_string(),
         method: "GET".to_string(),

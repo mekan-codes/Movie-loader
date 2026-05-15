@@ -37,6 +37,7 @@ export function inferSourceFromUrl(input: string): InferredSource {
     sourceOpenBehavior: "webview",
     resultOpenBehavior: "result_page",
     ambiguousQueryBehavior: "show_choices",
+    parserMode: "hybrid",
     baseUrl: parsed.origin,
     searchUrl,
     method: "GET",
