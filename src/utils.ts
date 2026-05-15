@@ -62,6 +62,7 @@ export function normalizeSource(source: SourceConfig): SourceConfig {
     sourceType: source.sourceType || "search",
     sourceOpenBehavior: source.sourceOpenBehavior || "webview",
     resultOpenBehavior: source.resultOpenBehavior || "result_page",
+    ambiguousQueryBehavior: source.ambiguousQueryBehavior || "show_choices",
     sourceKind: source.sourceKind === "direct" ? "direct" : "web",
     baseUrl: source.baseUrl.trim(),
     searchUrl: source.searchUrl.trim(),
@@ -89,10 +90,18 @@ export function normalizeSource(source: SourceConfig): SourceConfig {
     downloadSelector: cleanOptional(source.downloadSelector),
     downloadAttribute: cleanOptional(source.downloadAttribute) || "href",
     watchButtonSelector: cleanOptional(source.watchButtonSelector),
+    watchLinkTextPatterns:
+      Array.isArray(source.watchLinkTextPatterns) && source.watchLinkTextPatterns.length > 0
+        ? source.watchLinkTextPatterns.map((pattern) => pattern.trim()).filter(Boolean)
+        : defaultWatchPatterns(),
     episodeSelector: cleanOptional(source.episodeSelector),
     seasonSelector: cleanOptional(source.seasonSelector),
     playerSelector: cleanOptional(source.playerSelector) || "video, iframe",
     autoOpenFirstWatchLink: Boolean(source.autoOpenFirstWatchLink),
+    autoOpenBestMatch: source.autoOpenBestMatch !== false,
+    autoOpenWatchButton: source.autoOpenWatchButton !== false,
+    maxWatchResolveSteps: clampNumber(source.maxWatchResolveSteps, 0, 5, 2),
+    exactMatchThreshold: clampNumber(source.exactMatchThreshold, 50, 100, 85),
     headers: source.headers || {}
   };
 }
@@ -213,4 +222,15 @@ function clampNumber(
     return fallback;
   }
   return Math.min(max, Math.max(min, Math.round(value as number)));
+}
+
+function defaultWatchPatterns(): string[] {
+  return [
+    "watch full movie",
+    "watch now",
+    "play",
+    "start watching",
+    "смотреть",
+    "смотреть онлайн"
+  ];
 }

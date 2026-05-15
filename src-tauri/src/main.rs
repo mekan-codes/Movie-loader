@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{Manager, State};
+use tokio::time::sleep;
 use url::Url;
 
 const DEFAULT_USER_AGENT: &str = "CineFinder/0.1 local desktop aggregator";
@@ -48,6 +49,8 @@ struct SourceConfig {
     source_open_behavior: String,
     #[serde(default = "default_result_open_behavior")]
     result_open_behavior: String,
+    #[serde(default = "default_ambiguous_query_behavior")]
+    ambiguous_query_behavior: String,
     base_url: String,
     search_url: String,
     #[serde(default = "default_method")]
@@ -98,6 +101,8 @@ struct SourceConfig {
     download_attribute: Option<String>,
     #[serde(default)]
     watch_button_selector: Option<String>,
+    #[serde(default = "default_watch_link_text_patterns")]
+    watch_link_text_patterns: Vec<String>,
     #[serde(default)]
     episode_selector: Option<String>,
     #[serde(default)]
@@ -106,6 +111,14 @@ struct SourceConfig {
     player_selector: Option<String>,
     #[serde(default)]
     auto_open_first_watch_link: bool,
+    #[serde(default = "default_true")]
+    auto_open_best_match: bool,
+    #[serde(default = "default_true")]
+    auto_open_watch_button: bool,
+    #[serde(default = "default_max_watch_resolve_steps")]
+    max_watch_resolve_steps: u32,
+    #[serde(default = "default_exact_match_threshold")]
+    exact_match_threshold: u32,
     #[serde(default)]
     requires_javascript: bool,
     #[serde(default)]
@@ -158,6 +171,8 @@ struct SourceTestResult {
     fallback_used: bool,
     best_match: Option<SourcePreviewResult>,
     final_open_url: Option<String>,
+    query_specificity: Option<String>,
+    ambiguous: bool,
     detected_selectors: Vec<SelectorCandidate>,
 }
 
@@ -166,6 +181,9 @@ struct SourceTestResult {
 struct SourcePreviewResult {
     title: String,
     url: String,
+    year: Option<String>,
+    score: Option<f64>,
+    confidence_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,6 +255,33 @@ fn default_source_open_behavior() -> String {
 
 fn default_result_open_behavior() -> String {
     "result_page".to_string()
+}
+
+fn default_ambiguous_query_behavior() -> String {
+    "show_choices".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_watch_resolve_steps() -> u32 {
+    2
+}
+
+fn default_exact_match_threshold() -> u32 {
+    85
+}
+
+fn default_watch_link_text_patterns() -> Vec<String> {
+    vec![
+        "watch full movie".to_string(),
+        "watch now".to_string(),
+        "play".to_string(),
+        "start watching".to_string(),
+        "смотреть".to_string(),
+        "смотреть онлайн".to_string(),
+    ]
 }
 
 fn default_load_delay_ms() -> u64 {
@@ -733,6 +778,7 @@ fn save_source_to_db(
         source_type: normalized_source_type(&source.source_type),
         source_open_behavior: normalized_source_open_behavior(&source.source_open_behavior),
         result_open_behavior: normalized_result_open_behavior(&source.result_open_behavior),
+        ambiguous_query_behavior: normalized_ambiguous_query_behavior(&source.ambiguous_query_behavior),
         base_url: source.base_url.trim().to_string(),
         search_url: source.search_url.trim().to_string(),
         method: source.method.trim().to_uppercase(),
@@ -759,10 +805,15 @@ fn save_source_to_db(
         download_selector: clean_string(source.download_selector),
         download_attribute: clean_string(source.download_attribute),
         watch_button_selector: clean_string(source.watch_button_selector),
+        watch_link_text_patterns: normalize_watch_patterns(source.watch_link_text_patterns),
         episode_selector: clean_string(source.episode_selector),
         season_selector: clean_string(source.season_selector),
         player_selector: clean_string(source.player_selector).or_else(|| Some("video, iframe".to_string())),
         auto_open_first_watch_link: source.auto_open_first_watch_link,
+        auto_open_best_match: source.auto_open_best_match,
+        auto_open_watch_button: source.auto_open_watch_button,
+        max_watch_resolve_steps: source.max_watch_resolve_steps.min(5),
+        exact_match_threshold: source.exact_match_threshold.clamp(50, 100),
         requires_javascript: source.requires_javascript,
         headers: source.headers,
         created_at: Some(created_at.clone()),
@@ -959,8 +1010,18 @@ async fn search_single_source(source: SourceConfig, query: String) -> SourceSear
 
     match parse_results(&source, &query, &search_url, &html) {
         Ok(candidates) => {
+            let decision = decide_resolution(&source, &query, candidates);
+            if decision.fallback_to_search || decision.results.is_empty() {
+                return outcome(
+                    &source,
+                    "ready",
+                    Some(decision.reason),
+                    started,
+                    vec![webview_result(&source, &query, &search_url)],
+                );
+            }
             let results =
-                resolve_playable_results(&client, &headers, &source, &search_url, candidates)
+                resolve_playable_results(&client, &headers, &source, &search_url, decision.results)
                     .await;
             if results.is_empty() {
                 outcome(
@@ -974,10 +1035,7 @@ async fn search_single_source(source: SourceConfig, query: String) -> SourceSear
                 outcome(
                     &source,
                     "found",
-                    Some(format!(
-                        "Parsed {} result(s). Best match opens the exact result page.",
-                        results.len()
-                    )),
+                    Some(decision.reason),
                     started,
                     results,
                 )
@@ -1005,10 +1063,15 @@ async fn test_direct_source(
             preview_results: vec![SourcePreviewResult {
                 title: format!("Provider card: {}", source.name),
                 url: final_search_url,
+                year: None,
+                score: None,
+                confidence_reason: None,
             }],
             fallback_used: true,
             best_match: None,
             final_open_url: Some(build_search_url(&source, &query)),
+            query_specificity: None,
+            ambiguous: false,
             detected_selectors: Vec::new(),
         };
     }
@@ -1024,10 +1087,15 @@ async fn test_direct_source(
             preview_results: vec![SourcePreviewResult {
                 title: format!("Provider card: {}", source.name),
                 url: final_search_url.clone(),
+                year: None,
+                score: None,
+                confidence_reason: None,
             }],
             fallback_used: true,
             best_match: None,
             final_open_url: Some(final_search_url),
+            query_specificity: None,
+            ambiguous: false,
             detected_selectors: Vec::new(),
         };
     }
@@ -1043,13 +1111,21 @@ async fn test_direct_source(
             preview_results: vec![SourcePreviewResult {
                 title: source.name.clone(),
                 url: final_search_url.clone(),
+                year: None,
+                score: Some(100.0),
+                confidence_reason: Some("Configured direct page.".to_string()),
             }],
             fallback_used: false,
             best_match: Some(SourcePreviewResult {
                 title: source.name.clone(),
                 url: final_search_url.clone(),
+                year: None,
+                score: Some(100.0),
+                confidence_reason: Some("Configured direct page.".to_string()),
             }),
             final_open_url: Some(final_search_url),
+            query_specificity: Some("Direct page source.".to_string()),
+            ambiguous: false,
             detected_selectors: Vec::new(),
         };
     }
@@ -1068,6 +1144,8 @@ async fn test_direct_source(
                 fallback_used: false,
                 best_match: None,
                 final_open_url: Some(final_search_url),
+                query_specificity: None,
+                ambiguous: false,
                 detected_selectors: Vec::new(),
             }
         }
@@ -1092,6 +1170,8 @@ async fn test_direct_source(
                 fallback_used: false,
                 best_match: None,
                 final_open_url: Some(final_search_url),
+                query_specificity: None,
+                ambiguous: false,
                 detected_selectors: Vec::new(),
             }
         }
@@ -1103,38 +1183,78 @@ async fn test_direct_source(
             let detected_selectors = detect_selector_candidates(&html);
             let parsed_results = parse_results(&source, &query, &final_search_url, &html)
                 .unwrap_or_default();
-            let best_match = parsed_results.first().map(|result| SourcePreviewResult {
+            let parsed_count = parsed_results.len();
+            let decision = decide_resolution(&source, &query, parsed_results.clone());
+            let selected_result = decision
+                .selected
+                .clone()
+                .or_else(|| decision.results.first().cloned());
+            let watch_resolved_url = if !decision.fallback_to_search {
+                if let Some(selected) = selected_result.as_ref() {
+                    resolve_watch_url(&client, &headers, &source, &selected.url).await
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let final_open_url = if decision.fallback_to_search {
+                Some(final_search_url.clone())
+            } else {
+                watch_resolved_url
+                    .clone()
+                    .or_else(|| selected_result.as_ref().map(|result| result.url.clone()))
+                    .or_else(|| Some(final_search_url.clone()))
+            };
+            let best_match = selected_result.as_ref().map(|result| SourcePreviewResult {
                 title: result.title.clone(),
                 url: result.url.clone(),
+                year: result.year.clone(),
+                score: Some(result.confidence),
+                confidence_reason: result.raw_data.get("confidenceReason").cloned(),
             });
-            let preview_results = parsed_results
+            let preview_source = if decision.results.is_empty() {
+                parsed_results
+            } else {
+                decision.results.clone()
+            };
+            let preview_results = preview_source
                 .into_iter()
                 .take(5)
-                .map(|result| SourcePreviewResult {
-                    title: result.title,
-                    url: result.url,
+                .map(|result| {
+                    let confidence_reason = result.raw_data.get("confidenceReason").cloned();
+                    SourcePreviewResult {
+                        title: result.title,
+                        url: result.url,
+                        year: result.year,
+                        score: Some(result.confidence),
+                        confidence_reason,
+                    }
                 })
                 .collect::<Vec<_>>();
+            let mut message = if parsed_count == 0 {
+                "Source loaded, but no matching result cards were parsed.".to_string()
+            } else {
+                decision.reason.clone()
+            };
+            if watch_resolved_url.is_some() {
+                message.push_str(" Watch/player page resolved.");
+            }
 
             SourceTestResult {
                 ok: true,
-                message: if best_match.is_some() {
-                    "Source loaded and parsed exact result pages.".to_string()
-                } else {
-                    "Source loaded, but no matching result cards were parsed.".to_string()
-                },
+                message,
                 result_count: preview_results.len(),
                 elapsed_ms: started.elapsed().as_millis(),
                 final_search_url: Some(final_search_url.clone()),
                 raw_status: Some("loaded".to_string()),
                 selector_match_count,
                 preview_results,
-                fallback_used: best_match.is_none(),
-                final_open_url: best_match
-                    .as_ref()
-                    .map(|result| result.url.clone())
-                    .or_else(|| Some(final_search_url)),
+                fallback_used: decision.fallback_to_search || parsed_count == 0,
+                final_open_url,
                 best_match,
+                query_specificity: Some(decision.query_specificity),
+                ambiguous: decision.ambiguous,
                 detected_selectors,
             }
         }
@@ -1150,6 +1270,8 @@ async fn test_direct_source(
             fallback_used: false,
             best_match: None,
             final_open_url: None,
+            query_specificity: None,
+            ambiguous: false,
             detected_selectors: Vec::new(),
         },
         Err(FetchFailure::SelectorMissing(message)) => SourceTestResult {
@@ -1164,6 +1286,8 @@ async fn test_direct_source(
             fallback_used: true,
             best_match: None,
             final_open_url: Some(final_search_url),
+            query_specificity: None,
+            ambiguous: false,
             detected_selectors: Vec::new(),
         },
         Err(FetchFailure::Failed(message)) => SourceTestResult {
@@ -1178,6 +1302,8 @@ async fn test_direct_source(
             fallback_used: true,
             best_match: None,
             final_open_url: Some(final_search_url),
+            query_specificity: None,
+            ambiguous: false,
             detected_selectors: Vec::new(),
         },
     }
@@ -1205,8 +1331,7 @@ async fn fetch_search_html_with_retries(
         }
 
         if attempt < max_retries {
-            tauri::async_runtime::sleep(Duration::from_millis(700 + u64::from(attempt) * 400))
-                .await;
+            sleep(Duration::from_millis(700 + u64::from(attempt) * 400)).await;
         }
     }
 
@@ -1259,7 +1384,7 @@ async fn fetch_search_html_once(
 
     let delay_ms = source.load_delay_ms.min(10_000);
     if delay_ms > 0 {
-        tauri::async_runtime::sleep(Duration::from_millis(delay_ms)).await;
+        sleep(Duration::from_millis(delay_ms)).await;
     }
 
     let wait_selector = source
@@ -1386,52 +1511,100 @@ async fn resolve_watch_url(
     source: &SourceConfig,
     result_url: &str,
 ) -> Option<String> {
-    if source.watch_button_selector.is_none() && !source.auto_open_first_watch_link {
+    let can_auto_resolve = source.watch_button_selector.is_some()
+        || source.auto_open_watch_button
+        || source.auto_open_first_watch_link;
+    if !can_auto_resolve {
         return None;
     }
 
-    let response = client
-        .get(result_url)
-        .headers(headers.clone())
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let html = response.text().await.ok()?;
-    let document = Html::parse_document(&html);
-    let selector_values = source
-        .watch_button_selector
-        .as_deref()
-        .map(|selector| vec![selector.to_string()])
-        .unwrap_or_else(|| {
-            vec![
-                "a[href*='watch']".to_string(),
-                "a[href*='play']".to_string(),
-                "a[href*='episode']".to_string(),
-                "[data-href]".to_string(),
-                "[data-url]".to_string(),
-            ]
-        });
-
-    for selector_text in selector_values {
-        let Ok(selector) = Selector::parse(selector_text.trim()) else {
-            continue;
+    let mut current_url = result_url.to_string();
+    for _step in 0..source.max_watch_resolve_steps.min(5) {
+        let response = client
+            .get(&current_url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return if current_url == result_url { None } else { Some(current_url) };
+        }
+        let html = response.text().await.ok()?;
+        let document = Html::parse_document(&html);
+        if let Some(player_selector) = source.player_selector.as_deref() {
+            if Selector::parse(player_selector)
+                .ok()
+                .map(|selector| document.select(&selector).next().is_some())
+                .unwrap_or(false)
+            {
+                return if current_url == result_url { None } else { Some(current_url) };
+            }
+        }
+        let Some(next_url) = find_watch_url(source, &document, &current_url) else {
+            return if current_url == result_url { None } else { Some(current_url) };
         };
-        for node in document.select(&selector) {
-            let raw_url = node
-                .value()
-                .attr("href")
-                .or_else(|| node.value().attr("data-href"))
-                .or_else(|| node.value().attr("data-url"));
-            if let Some(url) = raw_url.and_then(|value| absolutize_url(&source.base_url, result_url, value)) {
+        if next_url == current_url {
+            return if current_url == result_url { None } else { Some(current_url) };
+        }
+        current_url = next_url;
+    }
+
+    if current_url == result_url {
+        None
+    } else {
+        Some(current_url)
+    }
+}
+
+fn find_watch_url(source: &SourceConfig, document: &Html, page_url: &str) -> Option<String> {
+    if let Some(selector_text) = source.watch_button_selector.as_deref() {
+        if let Ok(selector) = Selector::parse(selector_text.trim()) {
+            for node in document.select(&selector) {
+                if let Some(url) = node_url(source, page_url, node) {
+                    return Some(url);
+                }
+            }
+        }
+    }
+
+    if !source.auto_open_watch_button && !source.auto_open_first_watch_link {
+        return None;
+    }
+
+    let normalized_patterns = source
+        .watch_link_text_patterns
+        .iter()
+        .map(|pattern| normalize_comparable_title(pattern))
+        .collect::<Vec<_>>();
+    let selector = Selector::parse("a[href], button, [role='button'], [data-href], [data-url]").ok()?;
+    for node in document.select(&selector) {
+        let mut text_parts = vec![collapse_whitespace(&node.text().collect::<Vec<_>>().join(" "))];
+        if let Some(title) = node.value().attr("title") {
+            text_parts.push(title.to_string());
+        }
+        if let Some(label) = node.value().attr("aria-label") {
+            text_parts.push(label.to_string());
+        }
+        let text = normalize_comparable_title(&text_parts.join(" "));
+        if normalized_patterns
+            .iter()
+            .any(|pattern| !pattern.is_empty() && text.contains(pattern))
+        {
+            if let Some(url) = node_url(source, page_url, node) {
                 return Some(url);
             }
         }
     }
 
     None
+}
+
+fn node_url(source: &SourceConfig, page_url: &str, node: ElementRef<'_>) -> Option<String> {
+    node.value()
+        .attr("href")
+        .or_else(|| node.value().attr("data-href"))
+        .or_else(|| node.value().attr("data-url"))
+        .and_then(|value| absolutize_url(&source.base_url, page_url, value))
 }
 
 fn parse_results(
@@ -1527,6 +1700,8 @@ fn parse_results_with_selector(
         let year = year_selector
             .as_ref()
             .and_then(|selector| first_text(node, selector))
+            .or_else(|| first_text_any(node, common_year_selectors()))
+            .or_else(|| extract_year(&title))
             .filter(|value| !value.is_empty());
         let description = description_selector
             .as_ref()
@@ -1564,7 +1739,8 @@ fn parse_results_with_selector(
         raw_data.insert("rawLink".to_string(), raw_link);
         raw_data.insert("resultSelector".to_string(), result_selector_text.to_string());
 
-        let confidence = confidence_score(query, &title);
+        let scored = score_result_candidate(query, &title, year.as_deref());
+        let confidence = scored.score;
         results.push(SearchResult {
             id: format!("{}-{index}", source.id),
             source_id: source.id.clone(),
@@ -1581,7 +1757,10 @@ fn parse_results_with_selector(
             year,
             description,
             confidence,
-            raw_data,
+            raw_data: {
+                raw_data.insert("confidenceReason".to_string(), scored.reason);
+                raw_data
+            },
         });
     }
 
@@ -1593,6 +1772,192 @@ fn parse_results_with_selector(
     });
 
     Ok(results)
+}
+
+struct ResolverDecision {
+    fallback_to_search: bool,
+    results: Vec<SearchResult>,
+    reason: String,
+    ambiguous: bool,
+    query_specificity: String,
+    selected: Option<SearchResult>,
+}
+
+fn decide_resolution(
+    source: &SourceConfig,
+    query: &str,
+    candidates: Vec<SearchResult>,
+) -> ResolverDecision {
+    let specificity = is_specific_query(query);
+    let mut ranked = candidates
+        .into_iter()
+        .map(|mut candidate| {
+            let scored = score_result_candidate(query, &candidate.title, candidate.year.as_deref());
+            candidate.confidence = scored.score;
+            candidate
+                .raw_data
+                .insert("confidenceReason".to_string(), scored.reason);
+            candidate
+        })
+        .filter(|candidate| candidate.confidence >= 35.0)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .confidence
+            .partial_cmp(&left.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let Some(best) = ranked.first().cloned() else {
+        return ResolverDecision {
+            fallback_to_search: true,
+            results: Vec::new(),
+            reason: "Could not parse exact result. Open source search page.".to_string(),
+            ambiguous: false,
+            query_specificity: specificity.reason,
+            selected: None,
+        };
+    };
+
+    let close_second = ranked
+        .get(1)
+        .map(|second| best.confidence - second.confidence <= 8.0 && second.confidence >= 70.0)
+        .unwrap_or(false);
+    let query_year = extract_year(query);
+    let best_year = best.year.as_deref().and_then(extract_year);
+    let year_mismatch = query_year.is_some()
+        && best_year.is_some()
+        && query_year.as_deref() != best_year.as_deref();
+    let threshold = source.exact_match_threshold as f64;
+    let ambiguous = !specificity.specific
+        || close_second
+        || best.confidence < threshold
+        || year_mismatch
+        || !source.auto_open_best_match;
+
+    if ambiguous {
+        if source.ambiguous_query_behavior == "open_search_page" {
+            return ResolverDecision {
+                fallback_to_search: true,
+                results: Vec::new(),
+                reason: if year_mismatch {
+                    "Best result year does not match query year. Open source search page.".to_string()
+                } else {
+                    "Multiple possible matches. Open source search page.".to_string()
+                },
+                ambiguous: true,
+                query_specificity: specificity.reason,
+                selected: Some(best),
+            };
+        }
+
+        let choices = ranked
+            .into_iter()
+            .take(5)
+            .map(|mut result| {
+                result
+                    .raw_data
+                    .insert("resolution".to_string(), "ambiguous".to_string());
+                result
+                    .raw_data
+                    .insert("querySpecificity".to_string(), specificity.reason.clone());
+                result
+            })
+            .collect::<Vec<_>>();
+        return ResolverDecision {
+            fallback_to_search: false,
+            results: choices,
+            reason: if year_mismatch {
+                "Multiple possible matches; best year does not match the query.".to_string()
+            } else {
+                format!("Multiple possible matches. {}", specificity.reason)
+            },
+            ambiguous: true,
+            query_specificity: specificity.reason,
+            selected: Some(best),
+        };
+    }
+
+    let mut selected = best;
+    selected
+        .raw_data
+        .insert("resolution".to_string(), "exact".to_string());
+    selected
+        .raw_data
+        .insert("querySpecificity".to_string(), specificity.reason.clone());
+    ResolverDecision {
+        fallback_to_search: false,
+        reason: format!(
+            "Movie page found. {}",
+            selected
+                .raw_data
+                .get("confidenceReason")
+                .cloned()
+                .unwrap_or_else(|| "Strong title match.".to_string())
+        ),
+        results: vec![selected.clone()],
+        ambiguous: false,
+        query_specificity: specificity.reason,
+        selected: Some(selected),
+    }
+}
+
+struct QuerySpecificity {
+    specific: bool,
+    reason: String,
+}
+
+fn is_specific_query(query: &str) -> QuerySpecificity {
+    let normalized = normalize_comparable_title(query);
+    if extract_year(query).is_some() {
+        return QuerySpecificity {
+            specific: true,
+            reason: "Query includes a year.".to_string(),
+        };
+    }
+    let lower = query.to_lowercase();
+    if lower.contains("season")
+        || lower.contains("episode")
+        || lower.split_whitespace().any(|token| {
+            let token = token.trim_matches(|character: char| !character.is_alphanumeric());
+            (token.starts_with('s') || token.starts_with('S'))
+                && token.chars().skip(1).all(|character| character.is_ascii_digit())
+        })
+    {
+        return QuerySpecificity {
+            specific: true,
+            reason: "Query includes season or episode detail.".to_string(),
+        };
+    }
+    if broad_franchise_queries().contains(normalized.as_str()) {
+        return QuerySpecificity {
+            specific: false,
+            reason: "Broad franchise query.".to_string(),
+        };
+    }
+    if normalized.split_whitespace().count() >= 2 {
+        return QuerySpecificity {
+            specific: true,
+            reason: "Query is a specific title phrase.".to_string(),
+        };
+    }
+    QuerySpecificity {
+        specific: false,
+        reason: "Short broad query.".to_string(),
+    }
+}
+
+fn broad_franchise_queries() -> HashSet<&'static str> {
+    HashSet::from([
+        "batman",
+        "spider man",
+        "spiderman",
+        "superman",
+        "x men",
+        "xmen",
+        "star wars",
+        "star trek",
+    ])
 }
 
 fn outcome(
@@ -1679,6 +2044,7 @@ fn webview_result(source: &SourceConfig, query: &str, url: &str) -> SearchResult
     raw_data.insert("provider".to_string(), "javascript-webview".to_string());
     raw_data.insert("resultKind".to_string(), "provider".to_string());
     raw_data.insert("primary".to_string(), "true".to_string());
+    raw_data.insert("resolution".to_string(), "fallback".to_string());
 
     SearchResult {
         id: stable_id(&format!("{}:{url}", source.id)),
@@ -1701,6 +2067,8 @@ fn direct_page_result(source: &SourceConfig, query: &str, url: &str) -> SearchRe
     raw_data.insert("provider".to_string(), "direct-page".to_string());
     raw_data.insert("resultKind".to_string(), "parsed".to_string());
     raw_data.insert("primary".to_string(), "true".to_string());
+    raw_data.insert("resolution".to_string(), "exact".to_string());
+    raw_data.insert("confidenceReason".to_string(), "Configured direct page.".to_string());
     let playable_url = if is_playable_video_url(url) {
         Some(url.to_string())
     } else {
@@ -1849,15 +2217,28 @@ fn common_title_selectors() -> &'static [&'static str] {
         ".film-title",
         ".entry-title",
         "[title]",
+        "img[alt]",
     ]
 }
 
 fn common_link_selectors() -> &'static [&'static str] {
-    &["a[href]", ".title a", ".movie-title a", ".poster a", ".thumb a"]
+    &[
+        "a[href]",
+        ".title a",
+        ".movie-title a",
+        ".poster a",
+        ".thumb a",
+        "article a",
+        ".card a",
+    ]
 }
 
 fn common_poster_selectors() -> &'static [&'static str] {
     &["img", ".poster img", ".thumb img", "picture img"]
+}
+
+fn common_year_selectors() -> &'static [&'static str] {
+    &[".year", ".date", ".release"]
 }
 
 fn first_text(parent: ElementRef<'_>, selector: &Selector) -> Option<String> {
@@ -1923,40 +2304,124 @@ fn is_playable_video_url(value: &str) -> bool {
         .any(|extension| path.ends_with(extension))
 }
 
-fn confidence_score(query: &str, title: &str) -> f64 {
-    let normalized_query = normalize_match_key(query);
-    let normalized_title = normalize_match_key(title);
-    if normalized_query.is_empty() || normalized_title.is_empty() {
-        return 0.0;
-    }
-    if normalized_title == normalized_query {
-        return 100.0;
-    }
-    if normalized_title.contains(&normalized_query) {
-        return 92.0;
-    }
-    if normalized_query.contains(&normalized_title) && normalized_title.len() >= 4 {
-        return 74.0;
+struct CandidateScore {
+    score: f64,
+    reason: String,
+}
+
+fn score_result_candidate(query: &str, title: &str, candidate_year: Option<&str>) -> CandidateScore {
+    let query_year = extract_year(query);
+    let result_year = candidate_year.and_then(extract_year).or_else(|| extract_year(title));
+    let query_title = normalize_comparable_title(&remove_years(query));
+    let result_title = normalize_comparable_title(&remove_years(title));
+    if query_title.is_empty() || result_title.is_empty() {
+        return CandidateScore {
+            score: 0.0,
+            reason: "Missing title text.".to_string(),
+        };
     }
 
-    let query_tokens = content_tokens(&normalized_query)
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let title_tokens = content_tokens(&normalized_title)
-        .into_iter()
-        .collect::<HashSet<_>>();
-    if query_tokens.is_empty() {
-        return 0.0;
+    let mut score;
+    let mut reason;
+    if query_title == result_title && query_year.is_some() && result_year == query_year {
+        score = 100.0;
+        reason = "Exact title and year match.".to_string();
+    } else if query_title == result_title {
+        score = if query_year.is_some() { 82.0 } else { 90.0 };
+        reason = if query_year.is_some() {
+            "Exact title, but year is missing.".to_string()
+        } else {
+            "Exact title match.".to_string()
+        };
+    } else if result_title.contains(&query_title) {
+        score = if query_year.is_some() && result_year == query_year {
+            85.0
+        } else {
+            80.0
+        };
+        reason = if query_year.is_some() && result_year == query_year {
+            "Title contains query and year matches.".to_string()
+        } else {
+            "Title contains query.".to_string()
+        };
+    } else if query_title.contains(&result_title) && result_title.len() >= 4 {
+        score = 68.0;
+        reason = "Query contains candidate title.".to_string();
+    } else {
+        score = word_overlap_score(&query_title, &result_title);
+        let fuzzy = fuzzy_title_score(&query_title, &result_title);
+        if fuzzy > score {
+            score = fuzzy;
+        }
+        reason = if fuzzy >= 78.0 && fuzzy >= score {
+            "High fuzzy title similarity.".to_string()
+        } else if score >= 70.0 {
+            "High word overlap.".to_string()
+        } else {
+            "Partial title overlap.".to_string()
+        };
     }
 
+    if query_year.is_some() && result_year == query_year {
+        score = (score + 8.0_f64).min(100.0_f64);
+        reason = format!("{reason} Year matches.");
+    } else if query_year.is_some() && result_year.is_some() && result_year != query_year {
+        score = (score - 35.0_f64).min(60.0_f64);
+        reason = format!("{reason} Year differs from query.");
+    }
+
+    CandidateScore {
+        score: score.max(0.0_f64).round(),
+        reason,
+    }
+}
+
+fn fuzzy_title_score(query_title: &str, result_title: &str) -> f64 {
+    let score = (strsim::normalized_levenshtein(query_title, result_title) * 100.0).round();
+    if score >= 55.0 {
+        score
+    } else {
+        (score * 0.65).round()
+    }
+}
+
+fn word_overlap_score(query_title: &str, result_title: &str) -> f64 {
+    let query_tokens = content_tokens(query_title)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let title_tokens = content_tokens(result_title)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if query_tokens.is_empty() || title_tokens.is_empty() {
+        return 0.0;
+    }
     let overlap = query_tokens.intersection(&title_tokens).count() as f64;
     let query_coverage = overlap / query_tokens.len() as f64;
-    let title_coverage = if title_tokens.is_empty() {
-        0.0
-    } else {
-        overlap / title_tokens.len() as f64
-    };
-    (query_coverage * 86.0).max(title_coverage * 70.0).round()
+    let title_coverage = overlap / title_tokens.len() as f64;
+    (query_coverage * 82.0).max(title_coverage * 68.0).round()
+}
+
+fn extract_year(value: &str) -> Option<String> {
+    let mut digits = String::new();
+    for character in value.chars().chain(std::iter::once(' ')) {
+        if character.is_ascii_digit() {
+            digits.push(character);
+            continue;
+        }
+        if digits.len() == 4 && (digits.starts_with("19") || digits.starts_with("20")) {
+            return Some(digits);
+        }
+        digits.clear();
+    }
+    None
+}
+
+fn remove_years(value: &str) -> String {
+    value
+        .split_whitespace()
+        .filter(|token| extract_year(token).is_none())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn normalize_match_key(value: &str) -> String {
@@ -1971,6 +2436,11 @@ fn normalize_match_key(value: &str) -> String {
         }
     }
     collapse_whitespace(&normalized)
+}
+
+fn normalize_comparable_title(value: &str) -> String {
+    let normalized = normalize_match_key(value);
+    content_tokens(&normalized).join(" ")
 }
 
 fn content_tokens(value: &str) -> Vec<String> {
@@ -2041,6 +2511,27 @@ fn normalized_result_open_behavior(value: &str) -> String {
         "search_page".to_string()
     } else {
         "result_page".to_string()
+    }
+}
+
+fn normalized_ambiguous_query_behavior(value: &str) -> String {
+    if value.trim() == "open_search_page" {
+        "open_search_page".to_string()
+    } else {
+        "show_choices".to_string()
+    }
+}
+
+fn normalize_watch_patterns(patterns: Vec<String>) -> Vec<String> {
+    let normalized = patterns
+        .into_iter()
+        .map(|pattern| pattern.trim().to_string())
+        .filter(|pattern| !pattern.is_empty())
+        .collect::<Vec<_>>();
+    if normalized.is_empty() {
+        default_watch_link_text_patterns()
+    } else {
+        normalized
     }
 }
 
@@ -2144,6 +2635,7 @@ fn create_default_source(
         source_type: "search".to_string(),
         source_open_behavior: "webview".to_string(),
         result_open_behavior: "result_page".to_string(),
+        ambiguous_query_behavior: "show_choices".to_string(),
         base_url: base_url.to_string(),
         search_url: search_url.to_string(),
         method: "GET".to_string(),
@@ -2170,10 +2662,15 @@ fn create_default_source(
         download_selector: None,
         download_attribute: Some("href".to_string()),
         watch_button_selector: None,
+        watch_link_text_patterns: default_watch_link_text_patterns(),
         episode_selector: None,
         season_selector: None,
         player_selector: Some("video, iframe".to_string()),
         auto_open_first_watch_link: false,
+        auto_open_best_match: true,
+        auto_open_watch_button: true,
+        max_watch_resolve_steps: 2,
+        exact_match_threshold: 85,
         requires_javascript: true,
         headers: HashMap::new(),
         created_at: None,

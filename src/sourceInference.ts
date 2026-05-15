@@ -34,6 +34,7 @@ export function inferSourceFromUrl(input: string): InferredSource {
     sourceType: "search",
     sourceOpenBehavior: "webview",
     resultOpenBehavior: "result_page",
+    ambiguousQueryBehavior: "show_choices",
     baseUrl: parsed.origin,
     searchUrl,
     method: "GET",
@@ -60,10 +61,22 @@ export function inferSourceFromUrl(input: string): InferredSource {
     downloadSelector: "",
     downloadAttribute: "href",
     watchButtonSelector: "",
+    watchLinkTextPatterns: [
+      "watch full movie",
+      "watch now",
+      "play",
+      "start watching",
+      "смотреть",
+      "смотреть онлайн"
+    ],
     episodeSelector: "",
     seasonSelector: "",
     playerSelector: "video, iframe",
     autoOpenFirstWatchLink: false,
+    autoOpenBestMatch: true,
+    autoOpenWatchButton: true,
+    maxWatchResolveSteps: 2,
+    exactMatchThreshold: 85,
     requiresJavaScript: true,
     headers: {}
   };

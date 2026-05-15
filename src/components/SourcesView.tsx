@@ -23,6 +23,7 @@ import { inferSourceFromUrl } from "../sourceInference";
 import type {
   SelectorCandidate,
   ResultPageBehavior,
+  AmbiguousQueryBehavior,
   SourceConfig,
   SourceKind,
   SourceOpenBehavior,
@@ -43,7 +44,7 @@ interface SourcesViewProps {
   sources: SourceConfig[];
   onSave: (source: SourceConfig) => Promise<void>;
   onDelete: (sourceId: string) => Promise<void>;
-  onTest: (source: SourceConfig) => Promise<SourceTestResult>;
+  onTest: (source: SourceConfig, query?: string) => Promise<SourceTestResult>;
   onImport: (sources: SourceConfig[]) => Promise<void>;
   onDuplicate: (source: SourceConfig) => Promise<void>;
   onResetSource: (sourceId: string) => Promise<void>;
@@ -95,6 +96,7 @@ export function SourcesView({
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<SourceTestResult | null>(null);
   const [quickUrl, setQuickUrl] = useState("");
+  const [testQuery, setTestQuery] = useState("gravity falls");
   const [undoDraft, setUndoDraft] = useState<SourceConfig>(() => draft);
   const [undoHeadersText, setUndoHeadersText] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -161,7 +163,7 @@ export function SourcesView({
       const sourceForTest =
         source.id === draft.id ? normalizeForSave(source, headersText) : normalizeSource(source);
       validateDraft(sourceForTest, source.id === draft.id && Boolean(headersText.trim()));
-      const result = await onTest(sourceForTest);
+      const result = await onTest(sourceForTest, testQuery);
       setMessage(
         `${result.ok ? "OK" : "Failed"}: ${result.message} (${result.resultCount} result${
           result.resultCount === 1 ? "" : "s"
@@ -274,7 +276,13 @@ export function SourcesView({
         sourceType: template.patch.sourceType ?? current.sourceType,
         sourceOpenBehavior: template.patch.sourceOpenBehavior ?? current.sourceOpenBehavior,
         resultOpenBehavior: template.patch.resultOpenBehavior ?? current.resultOpenBehavior,
+        ambiguousQueryBehavior:
+          template.patch.ambiguousQueryBehavior ?? current.ambiguousQueryBehavior,
         requiresJavaScript: template.patch.requiresJavaScript ?? current.requiresJavaScript,
+        autoOpenBestMatch: template.patch.autoOpenBestMatch ?? current.autoOpenBestMatch,
+        autoOpenWatchButton: template.patch.autoOpenWatchButton ?? current.autoOpenWatchButton,
+        maxWatchResolveSteps: template.patch.maxWatchResolveSteps ?? current.maxWatchResolveSteps,
+        exactMatchThreshold: template.patch.exactMatchThreshold ?? current.exactMatchThreshold,
         resultSelector: template.patch.resultSelector ?? current.resultSelector,
         titleSelector: template.patch.titleSelector ?? current.titleSelector,
         linkSelector: template.patch.linkSelector ?? current.linkSelector,
@@ -674,6 +682,35 @@ export function SourcesView({
           </div>
 
           <div className="form-grid two">
+            <label>
+              <span>Ambiguous query behavior</span>
+              <select
+                value={draft.ambiguousQueryBehavior || "show_choices"}
+                onChange={(event) =>
+                  updateDraft(
+                    "ambiguousQueryBehavior",
+                    event.target.value as AmbiguousQueryBehavior
+                  )
+                }
+              >
+                <option value="show_choices">Show choices</option>
+                <option value="open_search_page">Open search page</option>
+              </select>
+            </label>
+            <label>
+              <span>Exact match threshold</span>
+              <input
+                type="number"
+                min={50}
+                max={100}
+                step={1}
+                value={draft.exactMatchThreshold ?? 85}
+                onChange={(event) => updateDraft("exactMatchThreshold", Number(event.target.value))}
+              />
+            </label>
+          </div>
+
+          <div className="form-grid two">
             <label className="checkbox-row inline-control">
               <input
                 type="checkbox"
@@ -681,6 +718,14 @@ export function SourcesView({
                 onChange={(event) => updateDraft("requiresJavaScript", event.target.checked)}
               />
               <span>Requires JavaScript</span>
+            </label>
+            <label className="checkbox-row inline-control">
+              <input
+                type="checkbox"
+                checked={draft.autoOpenBestMatch !== false}
+                onChange={(event) => updateDraft("autoOpenBestMatch", event.target.checked)}
+              />
+              <span>Auto-open best match when specific</span>
             </label>
           </div>
 
@@ -875,6 +920,36 @@ export function SourcesView({
                     />
                   </label>
                   <label>
+                    <span>Watch text patterns</span>
+                    <textarea
+                      value={(draft.watchLinkTextPatterns || []).join("\n")}
+                      onChange={(event) =>
+                        updateDraft(
+                          "watchLinkTextPatterns",
+                          event.target.value
+                            .split(/\r?\n|,/)
+                            .map((item) => item.trim())
+                            .filter(Boolean)
+                        )
+                      }
+                      placeholder={"watch full movie\nwatch now\nplay\nstart watching\nсмотреть"}
+                      rows={5}
+                    />
+                  </label>
+                  <label>
+                    <span>Max watch resolve steps</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={5}
+                      step={1}
+                      value={draft.maxWatchResolveSteps ?? 2}
+                      onChange={(event) =>
+                        updateDraft("maxWatchResolveSteps", Number(event.target.value))
+                      }
+                    />
+                  </label>
+                  <label>
                     <span>Season selector</span>
                     <input
                       value={draft.seasonSelector ?? ""}
@@ -893,12 +968,12 @@ export function SourcesView({
                   <label className="checkbox-row inline-control">
                     <input
                       type="checkbox"
-                      checked={Boolean(draft.autoOpenFirstWatchLink)}
+                      checked={draft.autoOpenWatchButton !== false}
                       onChange={(event) =>
-                        updateDraft("autoOpenFirstWatchLink", event.target.checked)
+                        updateDraft("autoOpenWatchButton", event.target.checked)
                       }
                     />
-                    <span>Auto-open first detected watch link</span>
+                    <span>Auto-open watch button</span>
                   </label>
                 </div>
               </details>
@@ -1006,6 +1081,15 @@ export function SourcesView({
             </>
           )}
 
+          <label>
+            <span>Resolve test query</span>
+            <input
+              value={testQuery}
+              onChange={(event) => setTestQuery(event.target.value)}
+              placeholder="gravity falls"
+            />
+          </label>
+
           <div className="editor-actions">
             <button className="primary-button" type="submit" disabled={busy}>
               <Save size={17} />
@@ -1060,17 +1144,36 @@ export function SourcesView({
           {testResult && (
             <div className="test-preview">
               <strong>Test Source Preview</strong>
+              <label>
+                <span>Sample query</span>
+                <input
+                  value={testQuery}
+                  onChange={(event) => setTestQuery(event.target.value)}
+                  placeholder="gravity falls"
+                />
+              </label>
               <span>URL: {testResult.finalSearchUrl || "n/a"}</span>
               <span>Status: {testResult.rawStatus || (testResult.ok ? "loaded" : "failed")}</span>
               <span>Selector matches: {testResult.selectorMatchCount ?? testResult.resultCount}</span>
               <span>Fallback provider card: {testResult.fallbackUsed ? "yes" : "no"}</span>
+              {testResult.querySpecificity && (
+                <span>
+                  Query decision: {testResult.ambiguous ? "ambiguous" : "specific"} -{" "}
+                  {testResult.querySpecificity}
+                </span>
+              )}
               {testResult.bestMatch && (
                 <span>Best match: {testResult.bestMatch.title}</span>
               )}
               {testResult.finalOpenUrl && <span>Final open URL: {testResult.finalOpenUrl}</span>}
-              {(testResult.previewResults || []).slice(0, 3).map((item, index) => (
+              {(testResult.previewResults || []).slice(0, 5).map((item, index) => (
                 <div className="test-preview-row" key={`${item.url}-${index}`}>
-                  <b>{item.title || "Untitled"}</b>
+                  <b>
+                    {item.title || "Untitled"}
+                    {typeof item.score === "number" ? ` (${Math.round(item.score)}%)` : ""}
+                    {item.year ? ` ${item.year}` : ""}
+                  </b>
+                  {item.confidenceReason && <small>{item.confidenceReason}</small>}
                   <small>{item.url}</small>
                 </div>
               ))}
@@ -1128,7 +1231,12 @@ const sourceTemplates: SourceTemplate[] = [
       sourceType: "search",
       sourceOpenBehavior: "webview",
       resultOpenBehavior: "result_page",
+      ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: true,
+      autoOpenBestMatch: true,
+      autoOpenWatchButton: true,
+      maxWatchResolveSteps: 2,
+      exactMatchThreshold: 85,
       resultSelector: "",
       waitForSelector: ""
     }
@@ -1141,7 +1249,12 @@ const sourceTemplates: SourceTemplate[] = [
       sourceType: "search",
       sourceOpenBehavior: "nativeThenWebview",
       resultOpenBehavior: "result_page",
+      ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: false,
+      autoOpenBestMatch: true,
+      autoOpenWatchButton: true,
+      maxWatchResolveSteps: 2,
+      exactMatchThreshold: 85,
       resultSelector: ".movie-card, .card, .item, article",
       waitForSelector: ".movie-card, .card, .item, article",
       titleSelector: ".title, h2, h3, [title]",
@@ -1159,7 +1272,10 @@ const sourceTemplates: SourceTemplate[] = [
       sourceType: "directPage",
       sourceOpenBehavior: "nativeThenWebview",
       resultOpenBehavior: "result_page",
+      ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: true,
+      autoOpenBestMatch: true,
+      autoOpenWatchButton: true,
       searchUrl: ""
     }
   },
@@ -1171,6 +1287,7 @@ const sourceTemplates: SourceTemplate[] = [
       sourceType: "webviewOnly",
       sourceOpenBehavior: "webview",
       resultOpenBehavior: "search_page",
+      ambiguousQueryBehavior: "open_search_page",
       requiresJavaScript: true,
       resultSelector: "",
       titleSelector: "",
@@ -1189,7 +1306,10 @@ const sourceTemplates: SourceTemplate[] = [
       sourceType: "search",
       sourceOpenBehavior: "webview",
       resultOpenBehavior: "result_page",
+      ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: true,
+      autoOpenBestMatch: true,
+      autoOpenWatchButton: true,
       loadDelayMs: 2500,
       maxRetries: 2,
       requestTimeoutMs: 15000

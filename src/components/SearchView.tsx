@@ -177,7 +177,14 @@ export function SearchView({
       <div className="results-stack">
         {outcomes.map((outcome) => {
           const isExpanded = expandedSources.includes(outcome.sourceId);
-          const displayedResults = isExpanded ? outcome.results : outcome.results.slice(0, 1);
+          const isAmbiguous = outcome.results.some(
+            (result) => result.rawData?.resolution === "ambiguous"
+          );
+          const displayedResults = isExpanded
+            ? outcome.results
+            : isAmbiguous
+              ? outcome.results.slice(0, 5)
+              : outcome.results.slice(0, 1);
           const hiddenCount = Math.max(0, outcome.results.length - displayedResults.length);
 
           return (
@@ -283,6 +290,7 @@ function ResultCard({
 }) {
   const alternatives = parseAlternatives(result);
   const isProviderCard = result.rawData?.resultKind === "provider";
+  const resolutionLabel = resultLabel(result, isProviderCard);
 
   return (
     <article className="result-card">
@@ -301,13 +309,14 @@ function ResultCard({
         <div className="result-meta">
           <span>{result.sourceName}</span>
           <span>{result.openMode === "webview" ? "In-app viewer" : "Direct video"}</span>
-          <span>{isProviderCard ? "Available search" : `${Math.round(result.confidence)}% match`}</span>
+          <span>{resolutionLabel}</span>
+          {!isProviderCard && <span>{Math.round(result.confidence)}% match</span>}
         </div>
         {result.description && <p>{result.description}</p>}
         <div className="card-actions">
           <button type="button" className="primary-button compact" onClick={onOpen}>
             <Play size={16} />
-            <span>{result.openMode === "webview" ? "Open" : "Play"}</span>
+            <span>{isProviderCard ? "Open search" : result.openMode === "webview" ? "Open page" : "Play"}</span>
           </button>
           {result.openMode === "webview" && (
             <button
@@ -361,6 +370,22 @@ function ResultCard({
       </div>
     </article>
   );
+}
+
+function resultLabel(result: SearchResult, isProviderCard: boolean): string {
+  if (isProviderCard) {
+    return "Search fallback";
+  }
+  if (result.rawData?.resolution === "ambiguous") {
+    return "Possible match";
+  }
+  if (result.rawData?.openedVia === "watchButtonSelector") {
+    return "Ready to watch";
+  }
+  if (result.playableUrl) {
+    return "Ready to play";
+  }
+  return "Movie page found";
 }
 
 function StatusBadge({

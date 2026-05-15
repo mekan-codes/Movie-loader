@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { distance as levenshteinDistance } from "fastest-levenshtein";
 import { defaultSources, removedDefaultSourceIds } from "../data/samples";
 import { isPlayableVideoUrl } from "../media";
 import type {
@@ -11,7 +12,7 @@ import type {
   SourceTestResult
 } from "../types";
 import { createId, normalizeSource, stableId } from "../utils";
-import { confidenceScore, stripHtml } from "./builtinProviders";
+import { extractYear, stripHtml } from "./builtinProviders";
 
 declare global {
   interface Window {
@@ -54,7 +55,8 @@ const commonTitleSelectors = [
   ".movie-title",
   ".film-title",
   ".entry-title",
-  "[title]"
+  "[title]",
+  "img[alt]"
 ];
 
 const commonLinkSelectors = [
@@ -62,10 +64,23 @@ const commonLinkSelectors = [
   ".title a",
   ".movie-title a",
   ".poster a",
-  ".thumb a"
+  ".thumb a",
+  "article a",
+  ".card a"
 ];
 
 const commonPosterSelectors = ["img", ".poster img", ".thumb img", "picture img"];
+const commonYearSelectors = [".year", ".date", ".release"];
+const broadFranchiseQueries = new Set([
+  "batman",
+  "spider man",
+  "spiderman",
+  "superman",
+  "x men",
+  "xmen",
+  "star wars",
+  "star trek"
+]);
 
 export const api = {
   async listSources(): Promise<SourceConfig[]> {
@@ -195,18 +210,18 @@ export const api = {
     return reset;
   },
 
-  async testSource(source: SourceConfig): Promise<SourceTestResult> {
+  async testSource(source: SourceConfig, query = "gravity falls"): Promise<SourceTestResult> {
     const normalized = normalizeSource(source);
     if (isTauri()) {
       return invoke<SourceTestResult>("test_source", {
         source: normalized,
-        query: "gravity falls"
+        query
       });
     }
     if (normalized.sourceType === "webviewOnly" || normalized.sourceType === "directPage") {
-      return testWebSource(normalized);
+      return testWebSource(normalized, query);
     }
-    return testBrowserSource(normalized);
+    return testBrowserSource(normalized, query);
   },
 
   async searchSources(
@@ -436,11 +451,11 @@ function isRemovedDefaultSource(source: SourceConfig): boolean {
   );
 }
 
-function testWebSource(source: SourceConfig): SourceTestResult {
+function testWebSource(source: SourceConfig, sampleQuery = "gravity falls"): SourceTestResult {
   const started = performance.now();
   try {
     new URL(source.baseUrl);
-    const finalSearchUrl = buildSourceSearchUrl(source, "gravity falls");
+    const finalSearchUrl = buildSourceSearchUrl(source, sampleQuery);
     return {
       ok: true,
       message: "Web source is ready. Searches open in the in-app viewer.",
@@ -451,6 +466,8 @@ function testWebSource(source: SourceConfig): SourceTestResult {
       selectorMatchCount: 1,
       previewResults: [{ title: `Provider card: ${source.name}`, url: finalSearchUrl }],
       fallbackUsed: true,
+      querySpecificity: null,
+      ambiguous: false,
       detectedSelectors: [],
       bestMatch: null,
       finalOpenUrl: finalSearchUrl
@@ -466,6 +483,8 @@ function testWebSource(source: SourceConfig): SourceTestResult {
       selectorMatchCount: 0,
       previewResults: [],
       fallbackUsed: false,
+      querySpecificity: null,
+      ambiguous: false,
       detectedSelectors: [],
       bestMatch: null,
       finalOpenUrl: null
@@ -473,7 +492,12 @@ function testWebSource(source: SourceConfig): SourceTestResult {
   }
 }
 
-function providerFallbackResult(source: SourceConfig, query: string, url: string): SearchResult {
+function providerFallbackResult(
+  source: SourceConfig,
+  query: string,
+  url: string,
+  description = "Could not parse exact result. Open source search page."
+): SearchResult {
   return {
     id: stableId(`${source.id}:${url}`, "result"),
     sourceId: source.id,
@@ -484,12 +508,13 @@ function providerFallbackResult(source: SourceConfig, query: string, url: string
     playableUrl: null,
     posterUrl: null,
     year: null,
-    description: "No parsed results. Open source search page.",
+    description,
     confidence: 0,
     rawData: {
       provider: "fallback-provider",
       resultKind: "provider",
-      primary: "true"
+      primary: "true",
+      resolution: "fallback"
     }
   };
 }
@@ -511,7 +536,9 @@ function directPageResult(source: SourceConfig, query: string, url: string): Sea
     rawData: {
       provider: "direct-page",
       resultKind: "parsed",
-      primary: "true"
+      primary: "true",
+      resolution: "exact",
+      confidenceReason: "Configured direct page."
     }
   };
 }
@@ -520,38 +547,57 @@ function isSelectorMissingError(error: unknown): boolean {
   return error instanceof Error && error.message === "No results or selector not found.";
 }
 
-async function testBrowserSource(source: SourceConfig): Promise<SourceTestResult> {
+async function testBrowserSource(
+  source: SourceConfig,
+  sampleQuery = "gravity falls"
+): Promise<SourceTestResult> {
   const started = performance.now();
-  const sampleQuery = "gravity falls";
   const finalSearchUrl = buildSourceSearchUrl(source, sampleQuery);
   try {
     const html = await fetchBrowserSearchHtml(source, finalSearchUrl);
     const document = new DOMParser().parseFromString(html, "text/html");
     const detectedSelectors = detectSelectorCandidates(document);
     const parsedResults = parseBrowserResults(source, sampleQuery, finalSearchUrl, html);
+    const decision = decideResolution(source, sampleQuery, parsedResults);
     const bestMatch = parsedResults[0] ?? null;
     const selectorMatchCount =
       detectedSelectors.find((candidate) => candidate.selectorType === "result")?.matchCount ??
       parsedResults.length;
     const previewResults = parsedResults
       .slice(0, 5)
-      .map((result) => ({ title: result.title, url: result.url }));
+      .map((result) => ({ title: result.title, url: result.url, year: result.year }));
 
     return {
       ok: true,
       message: bestMatch
-        ? "Source loaded and parsed exact result pages."
+        ? `${decision.specific ? "Specific" : "Ambiguous"} query. ${decision.reason}`
         : "Source loaded, but no matching result cards were parsed. Searches will use the fallback card.",
       resultCount: previewResults.length,
       elapsedMs: Math.round(performance.now() - started),
       finalSearchUrl,
       rawStatus: "loaded",
       selectorMatchCount,
-      previewResults,
+      previewResults: previewResults.map((result) => ({
+        ...result,
+        score: parsedResults.find((candidate) => candidate.url === result.url)?.confidence,
+        confidenceReason:
+          parsedResults.find((candidate) => candidate.url === result.url)?.rawData?.confidenceReason ??
+          null
+      })),
       fallbackUsed: previewResults.length === 0,
+      querySpecificity: decision.specificityReason,
+      ambiguous: decision.ambiguous,
       detectedSelectors,
-      bestMatch: bestMatch ? { title: bestMatch.title, url: bestMatch.url } : null,
-      finalOpenUrl: bestMatch?.url ?? finalSearchUrl
+      bestMatch: bestMatch
+        ? {
+            title: bestMatch.title,
+            url: bestMatch.url,
+            year: bestMatch.year,
+            score: bestMatch.confidence,
+            confidenceReason: bestMatch.rawData?.confidenceReason
+          }
+        : null,
+      finalOpenUrl: decision.selected?.url ?? finalSearchUrl
     };
   } catch (error) {
     return {
@@ -564,6 +610,8 @@ async function testBrowserSource(source: SourceConfig): Promise<SourceTestResult
       selectorMatchCount: 0,
       previewResults: [],
       fallbackUsed: false,
+      querySpecificity: null,
+      ambiguous: false,
       detectedSelectors: [],
       bestMatch: null,
       finalOpenUrl: finalSearchUrl
@@ -649,14 +697,25 @@ async function searchBrowserSource(
   try {
     const html = await fetchBrowserSearchHtml(source, searchUrl);
     const candidates = parseBrowserResults(source, query, searchUrl, html);
-    const results = await resolveBrowserResultTargets(source, searchUrl, candidates);
+    const decision = decideResolution(source, query, candidates);
+    if (decision.fallbackToSearch || decision.results.length === 0) {
+      return {
+        sourceId: source.id,
+        sourceName: source.name,
+        status: "ready",
+        message: decision.reason,
+        elapsedMs: Math.round(performance.now() - started),
+        results: [providerFallbackResult(source, query, searchUrl, decision.reason)]
+      };
+    }
+    const results = await resolveBrowserResultTargets(source, searchUrl, decision.results);
     return {
       sourceId: source.id,
       sourceName: source.name,
       status: results.length > 0 ? "found" : "ready",
       message:
         results.length > 0
-          ? `Parsed ${results.length} result${results.length === 1 ? "" : "s"}. Best match opens the exact result page.`
+          ? decision.reason
           : "No parsed results. Open source search page.",
       elapsedMs: Math.round(performance.now() - started),
       results: results.length > 0 ? results : [providerFallbackResult(source, query, searchUrl)]
@@ -762,6 +821,241 @@ function parseBrowserResults(
   return bestResults.filter((result) => result.confidence >= 12).slice(0, 24);
 }
 
+function decideResolution(
+  source: SourceConfig,
+  query: string,
+  candidates: SearchResult[]
+): {
+  specific: boolean;
+  ambiguous: boolean;
+  fallbackToSearch: boolean;
+  selected: SearchResult | null;
+  results: SearchResult[];
+  reason: string;
+  specificityReason: string;
+} {
+  const ranked = candidates
+    .map((candidate) => {
+      const scored = scoreResultCandidate(query, candidate.title, candidate.year);
+      return {
+        ...candidate,
+        confidence: scored.score,
+        rawData: {
+          ...candidate.rawData,
+          confidenceReason: scored.reason
+        }
+      };
+    })
+    .filter((candidate) => candidate.confidence >= 35)
+    .sort((left, right) => right.confidence - left.confidence);
+
+  const best = ranked[0] ?? null;
+  const specificity = isSpecificQuery(query);
+  if (!best) {
+    return {
+      specific: specificity.specific,
+      ambiguous: false,
+      fallbackToSearch: true,
+      selected: null,
+      results: [],
+      reason: "Could not parse exact result. Open source search page.",
+      specificityReason: specificity.reason
+    };
+  }
+
+  const second = ranked[1] ?? null;
+  const closeSecond = Boolean(second && best.confidence - second.confidence <= 8 && second.confidence >= 70);
+  const threshold = source.exactMatchThreshold ?? 85;
+  const yearInfo = extractQueryYear(query);
+  const yearMismatch = Boolean(
+    yearInfo && best.year && normalizeYear(best.year) && normalizeYear(best.year) !== yearInfo
+  );
+  const ambiguous =
+    !specificity.specific ||
+    closeSecond ||
+    best.confidence < threshold ||
+    yearMismatch ||
+    source.autoOpenBestMatch === false;
+
+  if (ambiguous) {
+    if (source.ambiguousQueryBehavior === "open_search_page") {
+      return {
+        specific: specificity.specific,
+        ambiguous: true,
+        fallbackToSearch: true,
+        selected: null,
+        results: [],
+        reason: yearMismatch
+          ? "Best result year does not match query year. Open source search page."
+          : "Multiple possible matches. Open source search page.",
+        specificityReason: specificity.reason
+      };
+    }
+    const choices = ranked.slice(0, 5).map((result) => ({
+      ...result,
+      rawData: {
+        ...result.rawData,
+        resolution: "ambiguous",
+        querySpecificity: specificity.reason
+      }
+    }));
+    return {
+      specific: specificity.specific,
+      ambiguous: true,
+      fallbackToSearch: false,
+      selected: best,
+      results: choices,
+      reason: yearMismatch
+        ? "Multiple possible matches; best year does not match the query."
+        : `Multiple possible matches. ${specificity.reason}`,
+      specificityReason: specificity.reason
+    };
+  }
+
+  return {
+    specific: true,
+    ambiguous: false,
+    fallbackToSearch: false,
+    selected: best,
+    results: [
+      {
+        ...best,
+        rawData: {
+          ...best.rawData,
+          resolution: "exact",
+          querySpecificity: specificity.reason
+        }
+      }
+    ],
+    reason: `Movie page found. ${best.rawData?.confidenceReason || "Strong title match."}`,
+    specificityReason: specificity.reason
+  };
+}
+
+function isSpecificQuery(query: string): { specific: boolean; reason: string } {
+  const normalized = normalizeComparableTitle(query);
+  if (extractQueryYear(query)) {
+    return { specific: true, reason: "Query includes a year." };
+  }
+  if (/\b(s\d{1,2}|season\s+\d{1,2}|episode\s+\d{1,3}|ep\s*\d{1,3})\b/i.test(query)) {
+    return { specific: true, reason: "Query includes season or episode detail." };
+  }
+  if (broadFranchiseQueries.has(normalized)) {
+    return { specific: false, reason: "Broad franchise query." };
+  }
+  if (normalized.split(" ").length >= 2) {
+    return { specific: true, reason: "Query is a specific title phrase." };
+  }
+  return { specific: false, reason: "Short broad query." };
+}
+
+function scoreResultCandidate(
+  query: string,
+  title: string,
+  candidateYear?: string | null
+): { score: number; reason: string } {
+  const queryYear = extractQueryYear(query);
+  const resultYear = normalizeYear(candidateYear) || extractQueryYear(title);
+  const queryTitle = normalizeComparableTitle(query.replace(/\b(19|20)\d{2}\b/g, " "));
+  const resultTitle = normalizeComparableTitle(title.replace(/\b(19|20)\d{2}\b/g, " "));
+  if (!queryTitle || !resultTitle) {
+    return { score: 0, reason: "Missing title text." };
+  }
+
+  let score = 0;
+  let reason = "Low title similarity.";
+  if (queryTitle === resultTitle && queryYear && resultYear === queryYear) {
+    score = 100;
+    reason = "Exact title and year match.";
+  } else if (queryTitle === resultTitle) {
+    score = queryYear ? 82 : 90;
+    reason = queryYear ? "Exact title, but year is missing." : "Exact title match.";
+  } else if (resultTitle.includes(queryTitle)) {
+    score = queryYear && resultYear === queryYear ? 85 : 80;
+    reason = queryYear && resultYear === queryYear
+      ? "Title contains query and year matches."
+      : "Title contains query.";
+  } else if (queryTitle.includes(resultTitle) && resultTitle.length >= 4) {
+    score = 68;
+    reason = "Query contains candidate title.";
+  } else {
+    const overlap = wordOverlapScore(queryTitle, resultTitle);
+    const fuzzy = fuzzyTitleScore(queryTitle, resultTitle);
+    score = Math.max(overlap, fuzzy);
+    reason =
+      fuzzy >= 78 && fuzzy >= overlap
+        ? "High fuzzy title similarity."
+        : overlap >= 70
+          ? "High word overlap."
+          : "Partial title overlap.";
+  }
+
+  if (queryYear && resultYear === queryYear) {
+    score = Math.min(100, score + 8);
+    reason = `${reason} Year matches.`;
+  } else if (queryYear && resultYear && resultYear !== queryYear) {
+    score = Math.min(score - 35, 60);
+    reason = `${reason} Year differs from query.`;
+  }
+
+  return { score: Math.max(0, Math.round(score)), reason };
+}
+
+function fuzzyTitleScore(queryTitle: string, resultTitle: string): number {
+  const maxLength = Math.max(queryTitle.length, resultTitle.length);
+  if (maxLength === 0) {
+    return 0;
+  }
+  const normalized = 1 - levenshteinDistance(queryTitle, resultTitle) / maxLength;
+  const score = Math.round(normalized * 100);
+  return score >= 55 ? score : Math.round(score * 0.65);
+}
+
+function wordOverlapScore(queryTitle: string, resultTitle: string): number {
+  const queryTokens = tokenSet(queryTitle);
+  const resultTokens = tokenSet(resultTitle);
+  if (queryTokens.size === 0 || resultTokens.size === 0) {
+    return 0;
+  }
+  let overlap = 0;
+  queryTokens.forEach((token) => {
+    if (resultTokens.has(token)) {
+      overlap += 1;
+    }
+  });
+  const queryCoverage = overlap / queryTokens.size;
+  const resultCoverage = overlap / resultTokens.size;
+  return Math.round(Math.max(queryCoverage * 82, resultCoverage * 68));
+}
+
+function tokenSet(value: string): Set<string> {
+  return new Set(value.split(" ").filter((token) => token.length > 1));
+}
+
+function normalizeComparableTitle(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\b(i)\b/g, "1")
+    .replace(/\b(ii)\b/g, "2")
+    .replace(/\b(iii)\b/g, "3")
+    .replace(/\b(iv)\b/g, "4")
+    .replace(/\b(v)\b/g, "5")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\b(full|movie|watch|online|hd|free|season|episode|ep|show|film|смотреть|онлайн)\b/gu, " ")
+    .replace(/\b(s\d{1,2}|e\d{1,3}|ep\d{1,3})\b/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function extractQueryYear(value: string): string | null {
+  return normalizeYear(extractYear(value));
+}
+
+function normalizeYear(value?: string | null): string | null {
+  const match = value?.match(/\b(19|20)\d{2}\b/);
+  return match?.[0] ?? null;
+}
+
 function parseBrowserResultsWithSelector(
   source: SourceConfig,
   query: string,
@@ -790,7 +1084,10 @@ function parseBrowserResultsWithSelector(
       }
 
       const title = inferBrowserTitle(card, source, linkElement) || url;
-      const year = readText(source.yearSelector ? card.querySelector(source.yearSelector) : null);
+      const year =
+        readText(source.yearSelector ? card.querySelector(source.yearSelector) : null) ||
+        readText(firstMatchingElement(card, commonYearSelectors)) ||
+        extractYear(`${title} ${readText(card) || ""}`);
       const description = readText(
         source.descriptionSelector ? card.querySelector(source.descriptionSelector) : null
       );
@@ -818,7 +1115,8 @@ function parseBrowserResultsWithSelector(
         return [];
       }
       seen.add(key);
-      const confidence = confidenceScore(query, title);
+      const scored = scoreResultCandidate(query, title, year);
+      const confidence = scored.score;
 
       return [
         {
@@ -836,7 +1134,9 @@ function parseBrowserResultsWithSelector(
           rawData: {
             provider: "custom-browser",
             rank: String(index + 1),
-            resultSelector
+            resultSelector,
+            confidenceReason: scored.reason,
+            querySpecificity: isSpecificQuery(query).reason
           }
         }
       ];
@@ -963,42 +1263,95 @@ async function resolveBrowserWatchUrl(
   source: SourceConfig,
   resultUrl: string
 ): Promise<string | null> {
-  if (!source.watchButtonSelector && !source.autoOpenFirstWatchLink) {
+  const canAutoResolve =
+    Boolean(source.watchButtonSelector) ||
+    source.autoOpenWatchButton ||
+    source.autoOpenFirstWatchLink;
+  if (!canAutoResolve) {
     return null;
   }
 
+  let currentUrl = resultUrl;
+  const maxSteps = Math.max(0, Math.min(source.maxWatchResolveSteps ?? 2, 5));
   try {
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), source.requestTimeoutMs ?? 15000);
-    const response = await fetch(resultUrl, {
-      headers: source.headers,
-      signal: controller.signal
-    });
-    window.clearTimeout(timeout);
-    if (!response.ok) {
-      return null;
-    }
-    const html = await response.text();
-    const document = new DOMParser().parseFromString(html, "text/html");
-    const selectors = source.watchButtonSelector
-      ? [source.watchButtonSelector]
-      : ["a[href*='watch']", "a[href*='play']", "a[href*='episode']", "button[data-href]"];
-    for (const selector of selectors) {
-      const element = document.querySelector(selector);
-      const rawUrl =
-        readAttribute(element, "href") ||
-        readAttribute(element, "data-href") ||
-        readAttribute(element, "data-url");
-      const url = absoluteUrl(source.baseUrl, resultUrl, rawUrl);
-      if (url) {
-        return url;
+    for (let step = 0; step < maxSteps; step += 1) {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), source.requestTimeoutMs ?? 15000);
+      const response = await fetch(currentUrl, {
+        headers: source.headers,
+        signal: controller.signal
+      });
+      window.clearTimeout(timeout);
+      if (!response.ok) {
+        return currentUrl === resultUrl ? null : currentUrl;
       }
+      const html = await response.text();
+      const document = new DOMParser().parseFromString(html, "text/html");
+      if (source.playerSelector && document.querySelector(source.playerSelector)) {
+        return currentUrl === resultUrl ? null : currentUrl;
+      }
+
+      const nextUrl = findWatchLinkUrl(source, document, currentUrl);
+      if (!nextUrl || nextUrl === currentUrl) {
+        return currentUrl === resultUrl ? null : currentUrl;
+      }
+      currentUrl = nextUrl;
     }
+    return currentUrl === resultUrl ? null : currentUrl;
   } catch {
     return null;
   }
+}
+
+function findWatchLinkUrl(
+  source: SourceConfig,
+  document: Document,
+  pageUrl: string
+): string | null {
+  if (source.watchButtonSelector) {
+    const element = document.querySelector(source.watchButtonSelector);
+    const url = elementUrl(source, element, pageUrl);
+    if (url) {
+      return url;
+    }
+  }
+
+  if (!source.autoOpenWatchButton && !source.autoOpenFirstWatchLink) {
+    return null;
+  }
+
+  const patterns = (source.watchLinkTextPatterns || []).map((pattern) =>
+    normalizeComparableTitle(pattern)
+  );
+  const candidates = Array.from(
+    document.querySelectorAll("a[href], button, [role='button'], [data-href], [data-url]")
+  );
+  for (const element of candidates) {
+    const text = normalizeComparableTitle(
+      [
+        element.textContent || "",
+        element.getAttribute("title") || "",
+        element.getAttribute("aria-label") || ""
+      ].join(" ")
+    );
+    if (!text || !patterns.some((pattern) => pattern && text.includes(pattern))) {
+      continue;
+    }
+    const url = elementUrl(source, element, pageUrl);
+    if (url) {
+      return url;
+    }
+  }
 
   return null;
+}
+
+function elementUrl(source: SourceConfig, element: Element | null, pageUrl: string): string | null {
+  const rawUrl =
+    readAttribute(element, "href") ||
+    readAttribute(element, "data-href") ||
+    readAttribute(element, "data-url");
+  return absoluteUrl(source.baseUrl, pageUrl, rawUrl);
 }
 
 function readText(element: Element | null): string | null {

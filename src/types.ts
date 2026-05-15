@@ -16,6 +16,7 @@ export type OpenBehavior = "inApp" | "external";
 export type SourceType = "search" | "directPage" | "webviewOnly";
 export type SourceOpenBehavior = "webview" | "nativeThenWebview";
 export type ResultPageBehavior = "result_page" | "search_page";
+export type AmbiguousQueryBehavior = "show_choices" | "open_search_page";
 
 export interface SourceConfig {
   id: string;
@@ -29,6 +30,7 @@ export interface SourceConfig {
   sourceType?: SourceType;
   sourceOpenBehavior?: SourceOpenBehavior;
   resultOpenBehavior?: ResultPageBehavior;
+  ambiguousQueryBehavior?: AmbiguousQueryBehavior;
   sourceKind?: SourceKind;
   baseUrl: string;
   searchUrl: string;
@@ -56,10 +58,15 @@ export interface SourceConfig {
   downloadSelector?: string | null;
   downloadAttribute?: string | null;
   watchButtonSelector?: string | null;
+  watchLinkTextPatterns?: string[];
   episodeSelector?: string | null;
   seasonSelector?: string | null;
   playerSelector?: string | null;
   autoOpenFirstWatchLink?: boolean;
+  autoOpenBestMatch?: boolean;
+  autoOpenWatchButton?: boolean;
+  maxWatchResolveSteps?: number;
+  exactMatchThreshold?: number;
   requiresJavaScript: boolean;
   headers: Record<string, string>;
   createdAt?: string | null;
@@ -114,11 +121,16 @@ export interface SourceTestResult {
   detectedSelectors?: SelectorCandidate[];
   bestMatch?: SourcePreviewResult | null;
   finalOpenUrl?: string | null;
+  querySpecificity?: string | null;
+  ambiguous?: boolean;
 }
 
 export interface SourcePreviewResult {
   title: string;
   url: string;
+  year?: string | null;
+  score?: number;
+  confidenceReason?: string | null;
 }
 
 export interface SelectorCandidate {

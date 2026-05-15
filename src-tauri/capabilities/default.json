@@ -3,5 +3,10 @@
   "identifier": "main-capability",
   "description": "Default permissions for the CineFinder main window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:webview:allow-create-webview-window",
+    "core:webview:allow-set-webview-focus",
+    "core:window:allow-create"
+  ]
 }

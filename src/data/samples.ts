@@ -69,6 +69,7 @@ export function createEmptySource(): SourceConfig {
     sourceType: "search",
     sourceOpenBehavior: "webview",
     resultOpenBehavior: "result_page",
+    ambiguousQueryBehavior: "show_choices",
     baseUrl: "",
     searchUrl: "",
     method: "GET",
@@ -92,10 +93,15 @@ export function createEmptySource(): SourceConfig {
     downloadSelector: "",
     downloadAttribute: "href",
     watchButtonSelector: "",
+    watchLinkTextPatterns: defaultWatchPatterns(),
     episodeSelector: "",
     seasonSelector: "",
     playerSelector: "video, iframe",
     autoOpenFirstWatchLink: false,
+    autoOpenBestMatch: true,
+    autoOpenWatchButton: true,
+    maxWatchResolveSteps: 2,
+    exactMatchThreshold: 85,
     requiresJavaScript: true,
     headers: {},
     ...defaultTiming
@@ -122,6 +128,7 @@ function createDefaultSource(input: {
     sourceType: "search",
     sourceOpenBehavior: "webview",
     resultOpenBehavior: "result_page",
+    ambiguousQueryBehavior: "show_choices",
     baseUrl: input.baseUrl,
     searchUrl: input.searchUrl,
     method: "GET",
@@ -145,12 +152,28 @@ function createDefaultSource(input: {
     downloadSelector: "",
     downloadAttribute: "href",
     watchButtonSelector: "",
+    watchLinkTextPatterns: defaultWatchPatterns(),
     episodeSelector: "",
     seasonSelector: "",
     playerSelector: "video, iframe",
     autoOpenFirstWatchLink: false,
+    autoOpenBestMatch: true,
+    autoOpenWatchButton: true,
+    maxWatchResolveSteps: 2,
+    exactMatchThreshold: 85,
     requiresJavaScript: true,
     headers: {},
     ...defaultTiming
   };
+}
+
+function defaultWatchPatterns(): string[] {
+  return [
+    "watch full movie",
+    "watch now",
+    "play",
+    "start watching",
+    "смотреть",
+    "смотреть онлайн"
+  ];
 }
