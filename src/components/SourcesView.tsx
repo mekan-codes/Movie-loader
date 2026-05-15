@@ -44,6 +44,9 @@ interface SourcesViewProps {
   sources: SourceConfig[];
   onSave: (source: SourceConfig) => Promise<void>;
   onDelete: (sourceId: string) => Promise<void>;
+  onRestore: (sourceId: string) => Promise<void>;
+  onPermanentDelete: (sourceId: string) => Promise<void>;
+  onEmptyTrash: () => Promise<void>;
   onTest: (source: SourceConfig, query?: string) => Promise<SourceTestResult>;
   onImport: (sources: SourceConfig[]) => Promise<void>;
   onDuplicate: (source: SourceConfig) => Promise<void>;
@@ -81,6 +84,9 @@ export function SourcesView({
   sources,
   onSave,
   onDelete,
+  onRestore,
+  onPermanentDelete,
+  onEmptyTrash,
   onTest,
   onImport,
   onDuplicate,
@@ -100,18 +106,33 @@ export function SourcesView({
   const [undoDraft, setUndoDraft] = useState<SourceConfig>(() => draft);
   const [undoHeadersText, setUndoHeadersText] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [sourceTab, setSourceTab] = useState<"active" | "disabled" | "trash">("active");
 
   const sortedSources = useMemo(
     () =>
-      [...sources].sort((left, right) => {
+      sources
+        .filter((source) =>
+          sourceTab === "active"
+            ? source.enabled && !source.hidden && !source.isDeleted
+            : sourceTab === "disabled"
+              ? !source.enabled && !source.hidden && !source.isDeleted
+              : Boolean(source.isDeleted)
+        )
+        .sort((left, right) => {
         if (Boolean(left.hidden) !== Boolean(right.hidden)) {
           return left.hidden ? 1 : -1;
         }
         return left.name.localeCompare(right.name);
       }),
-    [sources]
+    [sourceTab, sources]
   );
-  const enabledVisibleCount = sources.filter((source) => source.enabled && !source.hidden).length;
+  const activeCount = sources.filter(
+    (source) => source.enabled && !source.hidden && !source.isDeleted
+  ).length;
+  const disabledCount = sources.filter(
+    (source) => !source.enabled && !source.hidden && !source.isDeleted
+  ).length;
+  const trashCount = sources.filter((source) => source.isDeleted).length;
   const draftKind: SourceKind = draft.sourceKind === "direct" ? "direct" : "web";
   const sourceType = draft.sourceType || "search";
 
@@ -280,8 +301,12 @@ export function SourcesView({
           template.patch.ambiguousQueryBehavior ?? current.ambiguousQueryBehavior,
         requiresJavaScript: template.patch.requiresJavaScript ?? current.requiresJavaScript,
         autoOpenBestMatch: template.patch.autoOpenBestMatch ?? current.autoOpenBestMatch,
+        autoResolveWatchPage:
+          template.patch.autoResolveWatchPage ?? current.autoResolveWatchPage,
         autoOpenWatchButton: template.patch.autoOpenWatchButton ?? current.autoOpenWatchButton,
         maxWatchResolveSteps: template.patch.maxWatchResolveSteps ?? current.maxWatchResolveSteps,
+        maxResolveSteps: template.patch.maxResolveSteps ?? current.maxResolveSteps,
+        resolveDelayMs: template.patch.resolveDelayMs ?? current.resolveDelayMs,
         exactMatchThreshold: template.patch.exactMatchThreshold ?? current.exactMatchThreshold,
         resultSelector: template.patch.resultSelector ?? current.resultSelector,
         titleSelector: template.patch.titleSelector ?? current.titleSelector,
@@ -344,7 +369,7 @@ export function SourcesView({
         <div>
           <h1>Sources</h1>
           <p>
-            {sources.length} configured, {enabledVisibleCount} enabled
+            {activeCount} active, {disabledCount} disabled, {trashCount} in trash
           </p>
         </div>
         <div className="toolbar">
@@ -355,10 +380,10 @@ export function SourcesView({
           <button
             type="button"
             className="secondary-button"
-            onClick={() => void handleDefaultAction(onRestoreDefaults, "Hidden defaults restored.")}
+            onClick={() => void handleDefaultAction(onRestoreDefaults, "Default sources restored.")}
           >
             <RefreshCw size={17} />
-            <span>Restore hidden</span>
+            <span>Restore defaults</span>
           </button>
           <button
             type="button"
@@ -372,6 +397,20 @@ export function SourcesView({
             <RotateCcw size={17} />
             <span>Reset defaults</span>
           </button>
+          {trashCount > 0 && (
+            <button
+              type="button"
+              className="secondary-button danger"
+              onClick={() => {
+                if (window.confirm("Permanently delete every source in Trash?")) {
+                  void handleDefaultAction(onEmptyTrash, "Trash emptied.");
+                }
+              }}
+            >
+              <Trash2 size={17} />
+              <span>Empty trash</span>
+            </button>
+          )}
           <button
             type="button"
             className="secondary-button"
@@ -426,6 +465,30 @@ export function SourcesView({
         </div>
       </section>
 
+      <div className="source-tab-row" role="tablist" aria-label="Source filters">
+        <button
+          className={cx("chip", sourceTab === "active" && "is-selected")}
+          type="button"
+          onClick={() => setSourceTab("active")}
+        >
+          Active {activeCount}
+        </button>
+        <button
+          className={cx("chip", sourceTab === "disabled" && "is-selected")}
+          type="button"
+          onClick={() => setSourceTab("disabled")}
+        >
+          Disabled {disabledCount}
+        </button>
+        <button
+          className={cx("chip", sourceTab === "trash" && "is-selected")}
+          type="button"
+          onClick={() => setSourceTab("trash")}
+        >
+          Trash {trashCount}
+        </button>
+      </div>
+
       <div className="source-layout">
         <div className="source-list" aria-label="Sources">
           {sortedSources.map((source) => (
@@ -439,94 +502,134 @@ export function SourcesView({
                   </small>
                   {source.userModified && <small className="source-kind-badge warm">Modified</small>}
                   {!source.enabled && <small className="source-kind-badge muted">Disabled</small>}
+                  {source.isDeleted && <small className="source-kind-badge danger">Trash</small>}
                   {source.hidden && <small className="source-kind-badge danger">Hidden</small>}
                 </div>
               </div>
               <div className="source-list-actions">
-                <button
-                  className="toggle-button"
-                  type="button"
-                  onClick={() =>
-                    void onSave({
-                      ...source,
-                      enabled: !source.enabled,
-                      hidden: false
-                    })
-                  }
-                  title={source.enabled && !source.hidden ? "Disable source" : "Enable source"}
-                >
-                  {source.enabled && !source.hidden ? <Check size={16} /> : <X size={16} />}
-                  <span>{source.enabled && !source.hidden ? "On" : "Off"}</span>
-                </button>
-                <button
-                  className="icon-button"
-                  type="button"
-                  onClick={() => void testDraft(source)}
-                  title="Test source"
-                  disabled={testingId === source.id}
-                >
-                  {testingId === source.id ? (
-                    <RefreshCw className="spin" size={16} />
-                  ) : (
-                    <TestTube2 size={16} />
-                  )}
-                </button>
-                <button
-                  className="icon-button"
-                  type="button"
-                  onClick={() => beginEdit(source)}
-                  title="Edit source"
-                >
-                  <Pencil size={16} />
-                </button>
-                <button
-                  className="icon-button"
-                  type="button"
-                  onClick={() => void onDuplicate(source)}
-                  title="Duplicate source"
-                >
-                  <Copy size={16} />
-                </button>
-                {source.isDefault && (
-                  <button
-                    className="icon-button"
-                    type="button"
-                    onClick={() => {
-                      if (window.confirm(`Reset ${source.name} to the built-in default config?`)) {
+                {source.isDeleted ? (
+                  <>
+                    <button
+                      className="secondary-button compact"
+                      type="button"
+                      onClick={() =>
                         void handleDefaultAction(
-                          () => onResetSource(source.id),
-                          `${source.name} reset.`
-                        );
+                          () => onRestore(source.id),
+                          `${source.name} restored.`
+                        )
                       }
-                    }}
-                    title="Reset this default source"
-                  >
-                    <RotateCcw size={16} />
-                  </button>
+                      title="Restore source"
+                    >
+                      <Undo2 size={15} />
+                      <span>Restore</span>
+                    </button>
+                    <button
+                      className="icon-button danger"
+                      type="button"
+                      onClick={() => {
+                        if (window.confirm(`Permanently delete ${source.name}?`)) {
+                          void handleDefaultAction(
+                            () => onPermanentDelete(source.id),
+                            `${source.name} permanently deleted.`
+                          );
+                        }
+                      }}
+                      title="Permanently delete source"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      className="toggle-button"
+                      type="button"
+                      onClick={() =>
+                        void onSave({
+                          ...source,
+                          enabled: !source.enabled,
+                          hidden: false
+                        })
+                      }
+                      title={source.enabled && !source.hidden ? "Disable source" : "Enable source"}
+                    >
+                      {source.enabled && !source.hidden ? <Check size={16} /> : <X size={16} />}
+                      <span>{source.enabled && !source.hidden ? "On" : "Off"}</span>
+                    </button>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => void testDraft(source)}
+                      title="Test source"
+                      disabled={testingId === source.id}
+                    >
+                      {testingId === source.id ? (
+                        <RefreshCw className="spin" size={16} />
+                      ) : (
+                        <TestTube2 size={16} />
+                      )}
+                    </button>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => beginEdit(source)}
+                      title="Edit source"
+                    >
+                      <Pencil size={16} />
+                    </button>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => void onDuplicate(source)}
+                      title="Duplicate source"
+                    >
+                      <Copy size={16} />
+                    </button>
+                    {source.isDefault && (
+                      <button
+                        className="icon-button"
+                        type="button"
+                        onClick={() => {
+                          if (window.confirm(`Reset ${source.name} to the built-in default config?`)) {
+                            void handleDefaultAction(
+                              () => onResetSource(source.id),
+                              `${source.name} reset.`
+                            );
+                          }
+                        }}
+                        title="Reset this default source"
+                      >
+                        <RotateCcw size={16} />
+                      </button>
+                    )}
+                    <button
+                      className="icon-button danger"
+                      type="button"
+                      onClick={() => {
+                        if (window.confirm(`Move ${source.name} to Trash?`)) {
+                          void onDelete(source.id);
+                        }
+                      }}
+                      title="Move source to Trash"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </>
                 )}
-                <button
-                  className="icon-button danger"
-                  type="button"
-                  onClick={() => {
-                    const copy = source.isDefault
-                      ? `Hide ${source.name}? You can restore hidden defaults later.`
-                      : `Delete ${source.name}?`;
-                    if (window.confirm(copy)) {
-                      void onDelete(source.id);
-                    }
-                  }}
-                  title={source.isDefault ? "Hide source" : "Delete source"}
-                >
-                  <Trash2 size={16} />
-                </button>
               </div>
             </article>
           ))}
           {sortedSources.length === 0 && (
             <div className="empty-panel compact-empty">
               <Plus size={18} />
-              <strong>No sources</strong>
-              <span>Add a source config to begin.</span>
+              <strong>{sourceTab === "trash" ? "Trash is empty" : "No sources"}</strong>
+              <span>
+                {sourceTab === "active"
+                  ? "Enable a source or add a new config."
+                  : sourceTab === "disabled"
+                    ? "Disabled sources will appear here."
+                    : "Deleted sources will appear here."}
+              </span>
             </div>
           )}
         </div>
@@ -903,6 +1006,17 @@ export function SourcesView({
               <details>
                 <summary>Exact watching page</summary>
                 <div className="form-grid two">
+                  <label className="checkbox-row inline-control">
+                    <input
+                      type="checkbox"
+                      checked={draft.autoResolveWatchPage !== false}
+                      onChange={(event) => {
+                        updateDraft("autoResolveWatchPage", event.target.checked);
+                        updateDraft("autoOpenWatchButton", event.target.checked);
+                      }}
+                    />
+                    <span>Auto-resolve watch page</span>
+                  </label>
                   <label>
                     <span>Watch button selector</span>
                     <input
@@ -932,20 +1046,34 @@ export function SourcesView({
                             .filter(Boolean)
                         )
                       }
-                      placeholder={"watch full movie\nwatch now\nplay\nstart watching\nсмотреть"}
+                      placeholder={"watch full movie\nwatch online\nwatch now\nplay\nstart watching\nсмотреть\nсмотреть онлайн"}
                       rows={5}
                     />
                   </label>
                   <label>
-                    <span>Max watch resolve steps</span>
+                    <span>Max resolve steps</span>
                     <input
                       type="number"
                       min={0}
                       max={5}
                       step={1}
-                      value={draft.maxWatchResolveSteps ?? 2}
+                      value={draft.maxResolveSteps ?? draft.maxWatchResolveSteps ?? 2}
+                      onChange={(event) => {
+                        updateDraft("maxResolveSteps", Number(event.target.value));
+                        updateDraft("maxWatchResolveSteps", Number(event.target.value));
+                      }}
+                    />
+                  </label>
+                  <label>
+                    <span>Resolve delay ms</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={10000}
+                      step={250}
+                      value={draft.resolveDelayMs ?? 1500}
                       onChange={(event) =>
-                        updateDraft("maxWatchResolveSteps", Number(event.target.value))
+                        updateDraft("resolveDelayMs", Number(event.target.value))
                       }
                     />
                   </label>
@@ -973,7 +1101,7 @@ export function SourcesView({
                         updateDraft("autoOpenWatchButton", event.target.checked)
                       }
                     />
-                    <span>Auto-open watch button</span>
+                    <span>Match watch/play text patterns</span>
                   </label>
                 </div>
               </details>
@@ -1234,8 +1362,11 @@ const sourceTemplates: SourceTemplate[] = [
       ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: true,
       autoOpenBestMatch: true,
+      autoResolveWatchPage: true,
       autoOpenWatchButton: true,
       maxWatchResolveSteps: 2,
+      maxResolveSteps: 2,
+      resolveDelayMs: 1500,
       exactMatchThreshold: 85,
       resultSelector: "",
       waitForSelector: ""
@@ -1252,8 +1383,11 @@ const sourceTemplates: SourceTemplate[] = [
       ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: false,
       autoOpenBestMatch: true,
+      autoResolveWatchPage: true,
       autoOpenWatchButton: true,
       maxWatchResolveSteps: 2,
+      maxResolveSteps: 2,
+      resolveDelayMs: 1500,
       exactMatchThreshold: 85,
       resultSelector: ".movie-card, .card, .item, article",
       waitForSelector: ".movie-card, .card, .item, article",
@@ -1275,7 +1409,10 @@ const sourceTemplates: SourceTemplate[] = [
       ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: true,
       autoOpenBestMatch: true,
+      autoResolveWatchPage: true,
       autoOpenWatchButton: true,
+      maxResolveSteps: 2,
+      resolveDelayMs: 1500,
       searchUrl: ""
     }
   },
@@ -1289,6 +1426,7 @@ const sourceTemplates: SourceTemplate[] = [
       resultOpenBehavior: "search_page",
       ambiguousQueryBehavior: "open_search_page",
       requiresJavaScript: true,
+      autoResolveWatchPage: true,
       resultSelector: "",
       titleSelector: "",
       linkSelector: "",
@@ -1309,7 +1447,10 @@ const sourceTemplates: SourceTemplate[] = [
       ambiguousQueryBehavior: "show_choices",
       requiresJavaScript: true,
       autoOpenBestMatch: true,
+      autoResolveWatchPage: true,
       autoOpenWatchButton: true,
+      maxResolveSteps: 2,
+      resolveDelayMs: 1500,
       loadDelayMs: 2500,
       maxRetries: 2,
       requestTimeoutMs: 15000
@@ -1327,7 +1468,9 @@ function normalizeForSave(source: SourceConfig, headersText: string): SourceConf
     searchUrl,
     method: "GET",
     headers: parseHeaders(headersText),
-    hidden: Boolean(source.hidden) && !source.enabled
+    hidden: Boolean(source.hidden) && !source.enabled,
+    isDeleted: Boolean(source.isDeleted),
+    deletedAt: source.isDeleted ? source.deletedAt || new Date().toISOString() : null
   });
 }
 

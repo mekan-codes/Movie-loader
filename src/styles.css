@@ -338,6 +338,7 @@ p {
 }
 
 .danger-button,
+.secondary-button.danger,
 .icon-button.danger {
   color: var(--danger);
 }
@@ -367,6 +368,13 @@ p {
   align-items: center;
   gap: 8px;
   margin-top: 14px;
+}
+
+.source-tab-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
 }
 
 .chip.is-selected {
@@ -1020,6 +1028,33 @@ details summary {
 
 .webview-toolbar + iframe {
   height: calc(100% - 48px);
+}
+
+.native-webview-host {
+  position: relative;
+  width: 100%;
+  height: calc(100% - 48px);
+  min-height: 360px;
+  background: #101114;
+}
+
+.viewer-loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  padding: 18px;
+  color: #f6f7f8;
+  text-align: center;
+  background: #101114;
+  z-index: 2;
+}
+
+.viewer-loading-overlay span {
+  max-width: 560px;
+  color: #c6cad1;
+  font-size: 13px;
 }
 
 .provider-launch-panel {

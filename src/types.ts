@@ -26,6 +26,8 @@ export interface SourceConfig {
   isDefault?: boolean;
   userModified?: boolean;
   hidden?: boolean;
+  isDeleted?: boolean;
+  deletedAt?: string | null;
   note?: string | null;
   sourceType?: SourceType;
   sourceOpenBehavior?: SourceOpenBehavior;
@@ -62,10 +64,13 @@ export interface SourceConfig {
   episodeSelector?: string | null;
   seasonSelector?: string | null;
   playerSelector?: string | null;
+  autoResolveWatchPage?: boolean;
   autoOpenFirstWatchLink?: boolean;
   autoOpenBestMatch?: boolean;
   autoOpenWatchButton?: boolean;
   maxWatchResolveSteps?: number;
+  maxResolveSteps?: number;
+  resolveDelayMs?: number;
   exactMatchThreshold?: number;
   requiresJavaScript: boolean;
   headers: Record<string, string>;

@@ -69,15 +69,15 @@ export function SettingsView({
             </select>
           </label>
           <label>
-            <span>Open behavior</span>
+            <span>Open external links</span>
             <select
               value={settings.openBehavior}
               onChange={(event) =>
                 update("openBehavior", event.target.value as AppSettings["openBehavior"])
               }
             >
-              <option value="inApp">In-app viewer</option>
-              <option value="external">External browser</option>
+              <option value="inApp">Inside CineFinder by default</option>
+              <option value="external">External browser only when manually selected</option>
             </select>
           </label>
           <label>

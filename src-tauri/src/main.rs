@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use chrono::Utc;
+use futures::channel::oneshot;
 use futures::future::join_all;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -14,11 +15,15 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
-use tauri::{Manager, State};
-use tokio::time::sleep;
+use tauri::{
+    webview::{NewWindowResponse, PageLoadEvent, WebviewBuilder},
+    Emitter, Manager, State, WebviewUrl,
+};
+use tokio::time::{sleep, timeout};
 use url::Url;
 
 const DEFAULT_USER_AGENT: &str = "CineFinder/0.1 local desktop aggregator";
+const VIEWER_EVENT: &str = "cinefinder://viewer-state";
 
 struct AppState {
     db: Mutex<Connection>,
@@ -39,6 +44,10 @@ struct SourceConfig {
     user_modified: bool,
     #[serde(default)]
     hidden: bool,
+    #[serde(default)]
+    is_deleted: bool,
+    #[serde(default)]
+    deleted_at: Option<String>,
     #[serde(default)]
     note: Option<String>,
     #[serde(default = "default_source_kind")]
@@ -109,6 +118,8 @@ struct SourceConfig {
     season_selector: Option<String>,
     #[serde(default)]
     player_selector: Option<String>,
+    #[serde(default = "default_true")]
+    auto_resolve_watch_page: bool,
     #[serde(default)]
     auto_open_first_watch_link: bool,
     #[serde(default = "default_true")]
@@ -117,6 +128,10 @@ struct SourceConfig {
     auto_open_watch_button: bool,
     #[serde(default = "default_max_watch_resolve_steps")]
     max_watch_resolve_steps: u32,
+    #[serde(default = "default_max_watch_resolve_steps")]
+    max_resolve_steps: u32,
+    #[serde(default = "default_load_delay_ms")]
+    resolve_delay_ms: u64,
     #[serde(default = "default_exact_match_threshold")]
     exact_match_threshold: u32,
     #[serde(default)]
@@ -233,6 +248,39 @@ struct HistoryItem {
     duration_seconds: f64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewerBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewerOpenResult {
+    final_url: String,
+    resolved: bool,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewerEventPayload {
+    label: String,
+    status: String,
+    url: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewerResolveProbe {
+    kind: String,
+    url: Option<String>,
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -276,6 +324,7 @@ fn default_exact_match_threshold() -> u32 {
 fn default_watch_link_text_patterns() -> Vec<String> {
     vec![
         "watch full movie".to_string(),
+        "watch online".to_string(),
         "watch now".to_string(),
         "play".to_string(),
         "start watching".to_string(),
@@ -324,7 +373,16 @@ fn main() {
             record_history,
             remove_history_item,
             clear_history,
-            open_external_url
+            restore_source,
+            permanently_delete_source,
+            empty_source_trash,
+            open_external_url,
+            open_viewer_webview,
+            close_viewer_webview,
+            resize_viewer_webview,
+            reload_viewer_webview,
+            go_back_viewer_webview,
+            go_forward_viewer_webview
         ])
         .run(tauri::generate_context!())
         .expect("error while running CineFinder");
@@ -350,19 +408,63 @@ fn save_source(
 fn delete_source(state: State<'_, AppState>, source_id: String) -> Result<(), String> {
     let conn = state.db.lock().map_err(|_| "Database lock failed".to_string())?;
     let target = read_source_by_id(&conn, &source_id)?;
-    if target.is_default || target.default_source_id.is_some() {
-        save_source_to_db(
-            &conn,
-            SourceConfig {
-                enabled: false,
-                hidden: true,
-                user_modified: true,
-                ..target
+    save_source_to_db(
+        &conn,
+        SourceConfig {
+            hidden: false,
+            is_deleted: true,
+            deleted_at: Some(Utc::now().to_rfc3339()),
+            user_modified: if target.is_default || target.default_source_id.is_some() {
+                true
+            } else {
+                target.user_modified
             },
-        )?;
-    } else {
-        conn.execute("DELETE FROM sources WHERE id = ?1", params![source_id])
-            .map_err(|error| format!("Could not delete source: {error}"))?;
+            ..target
+        },
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+fn restore_source(state: State<'_, AppState>, source_id: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|_| "Database lock failed".to_string())?;
+    let target = read_source_by_id(&conn, &source_id)?;
+    save_source_to_db(
+        &conn,
+        SourceConfig {
+            hidden: false,
+            is_deleted: false,
+            deleted_at: None,
+            ..target
+        },
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+fn permanently_delete_source(state: State<'_, AppState>, source_id: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|_| "Database lock failed".to_string())?;
+    let target = read_source_by_id(&conn, &source_id)?;
+    if let Some(default_source_id) = target.default_source_id.as_deref() {
+        remember_deleted_default_source(&conn, default_source_id)?;
+    }
+    conn.execute("DELETE FROM sources WHERE id = ?1", params![source_id])
+        .map_err(|error| format!("Could not permanently delete source: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn empty_source_trash(state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|_| "Database lock failed".to_string())?;
+    let sources = read_sources(&conn)?;
+    for source in sources.iter().filter(|source| source.is_deleted) {
+        if let Some(default_source_id) = source.default_source_id.as_deref() {
+            remember_deleted_default_source(&conn, default_source_id)?;
+        }
+    }
+    for source in sources.into_iter().filter(|source| source.is_deleted) {
+        conn.execute("DELETE FROM sources WHERE id = ?1", params![source.id])
+            .map_err(|error| format!("Could not empty trash: {error}"))?;
     }
     Ok(())
 }
@@ -387,6 +489,9 @@ fn reset_default_source(
             id: current.id,
             created_at: current.created_at,
             updated_at: current.updated_at,
+            hidden: false,
+            is_deleted: false,
+            deleted_at: None,
             ..default_source
         },
     )
@@ -445,6 +550,7 @@ async fn search_sources(
         .into_iter()
         .filter(|source| source.enabled)
         .filter(|source| !source.hidden)
+        .filter(|source| !source.is_deleted)
         .filter(|source| {
             selected_ids
                 .as_ref()
@@ -624,6 +730,500 @@ fn open_external_url(url: String) -> Result<(), String> {
     open_url_with_system(parsed.as_str())
 }
 
+#[tauri::command]
+async fn open_viewer_webview(
+    window: tauri::Window,
+    label: String,
+    url: String,
+    bounds: ViewerBounds,
+    source: SourceConfig,
+) -> Result<ViewerOpenResult, String> {
+    let parsed = parse_external_http_url(&url)?;
+    let app = window.app_handle().clone();
+    close_viewer_by_label(&app, &label);
+
+    emit_viewer_state(
+        &app,
+        &label,
+        "Opening result page",
+        Some(parsed.as_str().to_string()),
+        None,
+    );
+
+    let resolving = source.auto_resolve_watch_page;
+    let initial_bounds = if resolving {
+        ViewerBounds {
+            x: -32000.0,
+            y: -32000.0,
+            width: 1.0,
+            height: 1.0,
+        }
+    } else {
+        bounds.clone()
+    };
+    let window_label = window.label().to_string();
+    let app_for_page = app.clone();
+    let page_label = label.clone();
+    let app_for_popup = app.clone();
+    let popup_label = label.clone();
+    let app_for_nav = app.clone();
+    let nav_label = label.clone();
+
+    let builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(parsed.clone()))
+        .initialization_script_for_all_frames(viewer_initialization_script())
+        .on_page_load(move |_webview, payload| {
+            let status = match payload.event() {
+                PageLoadEvent::Started => "Opening result page",
+                PageLoadEvent::Finished => "Ready",
+            };
+            let _ = app_for_page.emit_to(
+                &window_label,
+                VIEWER_EVENT,
+                ViewerEventPayload {
+                    label: page_label.clone(),
+                    status: status.to_string(),
+                    url: Some(payload.url().to_string()),
+                    message: None,
+                },
+            );
+        })
+        .on_new_window(move |popup_url, _features| {
+            if let Some(webview) = app_for_popup.get_webview(&popup_label) {
+                let _ = webview.navigate(popup_url.clone());
+            }
+            emit_viewer_state(
+                &app_for_popup,
+                &popup_label,
+                "Opening watch page",
+                Some(popup_url.to_string()),
+                None,
+            );
+            NewWindowResponse::Deny
+        })
+        .on_navigation(move |navigation_url| {
+            emit_viewer_state(
+                &app_for_nav,
+                &nav_label,
+                "Opening result page",
+                Some(navigation_url.to_string()),
+                None,
+            );
+            true
+        });
+
+    let webview = window
+        .add_child(
+            builder,
+            tauri::LogicalPosition::new(initial_bounds.x, initial_bounds.y),
+            tauri::LogicalSize::new(initial_bounds.width, initial_bounds.height),
+        )
+        .map_err(|error| format!("Could not open in-app viewer: {error}"))?;
+
+    if resolving {
+        let _ = webview.hide();
+    }
+
+    let result = resolve_viewer_webview(&app, &label, &webview, &source, parsed).await;
+
+    webview
+        .set_position(tauri::LogicalPosition::new(bounds.x, bounds.y))
+        .map_err(|error| format!("Could not position viewer: {error}"))?;
+    webview
+        .set_size(tauri::LogicalSize::new(bounds.width, bounds.height))
+        .map_err(|error| format!("Could not size viewer: {error}"))?;
+    let _ = webview.show();
+
+    match result {
+        Ok(result) => {
+            emit_viewer_state(
+                &app,
+                &label,
+                &result.status,
+                Some(result.final_url.clone()),
+                None,
+            );
+            Ok(result)
+        }
+        Err(error) => {
+            let final_url = webview
+                .url()
+                .map(|url| url.to_string())
+                .unwrap_or_else(|_| url.clone());
+            emit_viewer_state(
+                &app,
+                &label,
+                "Could not auto-resolve, showing result page",
+                Some(final_url.clone()),
+                Some(error),
+            );
+            Ok(ViewerOpenResult {
+                final_url,
+                resolved: false,
+                status: "Could not auto-resolve, showing result page".to_string(),
+            })
+        }
+    }
+}
+
+#[tauri::command]
+fn close_viewer_webview(window: tauri::Window, label: String) -> Result<(), String> {
+    close_viewer_by_label(window.app_handle(), &label);
+    Ok(())
+}
+
+#[tauri::command]
+fn resize_viewer_webview(
+    window: tauri::Window,
+    label: String,
+    bounds: ViewerBounds,
+) -> Result<(), String> {
+    let Some(webview) = window.app_handle().get_webview(&label) else {
+        return Ok(());
+    };
+    webview
+        .set_position(tauri::LogicalPosition::new(bounds.x, bounds.y))
+        .map_err(|error| format!("Could not position viewer: {error}"))?;
+    webview
+        .set_size(tauri::LogicalSize::new(bounds.width, bounds.height))
+        .map_err(|error| format!("Could not size viewer: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn reload_viewer_webview(window: tauri::Window, label: String) -> Result<(), String> {
+    if let Some(webview) = window.app_handle().get_webview(&label) {
+        webview
+            .reload()
+            .map_err(|error| format!("Could not refresh viewer: {error}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn go_back_viewer_webview(window: tauri::Window, label: String) -> Result<(), String> {
+    if let Some(webview) = window.app_handle().get_webview(&label) {
+        webview
+            .eval("window.history.back();")
+            .map_err(|error| format!("Could not navigate back: {error}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn go_forward_viewer_webview(window: tauri::Window, label: String) -> Result<(), String> {
+    if let Some(webview) = window.app_handle().get_webview(&label) {
+        webview
+            .eval("window.history.forward();")
+            .map_err(|error| format!("Could not navigate forward: {error}"))?;
+    }
+    Ok(())
+}
+
+async fn resolve_viewer_webview(
+    app: &tauri::AppHandle,
+    label: &str,
+    webview: &tauri::Webview,
+    source: &SourceConfig,
+    original_url: Url,
+) -> Result<ViewerOpenResult, String> {
+    if !source.auto_resolve_watch_page {
+        wait_for_viewer_ready(webview, source_timeout_ms(source)).await;
+        let final_url = current_webview_url(webview, original_url.as_str());
+        return Ok(ViewerOpenResult {
+            final_url,
+            resolved: false,
+            status: "Ready".to_string(),
+        });
+    }
+
+    let original_url_string = original_url.to_string();
+    let mut opened_watch_page = false;
+    let mut found_player = false;
+    let max_steps = source.max_resolve_steps.min(5);
+
+    wait_for_viewer_ready(webview, source_timeout_ms(source)).await;
+
+    for step in 0..=max_steps {
+        emit_viewer_state(
+            app,
+            label,
+            "Looking for player",
+            Some(current_webview_url(webview, &original_url_string)),
+            None,
+        );
+        let delay_ms = source.resolve_delay_ms.min(10_000);
+        if delay_ms > 0 {
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
+
+        let probe = probe_viewer_watch_state(webview, source).await?;
+        if probe.kind == "player" {
+            found_player = true;
+            break;
+        }
+        if step >= max_steps {
+            break;
+        }
+
+        match probe.kind.as_str() {
+            "link" => {
+                let Some(next_url) = probe.url.as_deref() else {
+                    break;
+                };
+                let next_url = parse_external_http_url(next_url)?;
+                emit_viewer_state(
+                    app,
+                    label,
+                    "Opening watch page",
+                    Some(next_url.to_string()),
+                    None,
+                );
+                webview
+                    .navigate(next_url)
+                    .map_err(|error| format!("Could not open watch page: {error}"))?;
+                opened_watch_page = true;
+                wait_for_viewer_ready(webview, source_timeout_ms(source)).await;
+            }
+            "click" => {
+                emit_viewer_state(
+                    app,
+                    label,
+                    "Opening watch page",
+                    Some(current_webview_url(webview, &original_url_string)),
+                    None,
+                );
+                webview
+                    .eval(viewer_click_candidate_script())
+                    .map_err(|error| format!("Could not click watch button: {error}"))?;
+                opened_watch_page = true;
+                wait_for_viewer_ready(webview, source_timeout_ms(source)).await;
+            }
+            _ => break,
+        }
+    }
+
+    if !found_player && opened_watch_page {
+        let _ = webview.navigate(original_url.clone());
+        wait_for_viewer_ready(webview, source_timeout_ms(source)).await;
+    }
+
+    let final_url = current_webview_url(webview, original_url.as_str());
+    Ok(ViewerOpenResult {
+        final_url,
+        resolved: found_player,
+        status: if found_player {
+            "Ready".to_string()
+        } else {
+            "Could not auto-resolve, showing result page".to_string()
+        },
+    })
+}
+
+async fn probe_viewer_watch_state(
+    webview: &tauri::Webview,
+    source: &SourceConfig,
+) -> Result<ViewerResolveProbe, String> {
+    let script = viewer_probe_script(source)?;
+    let value = eval_webview_json(webview, script, 2_500).await?;
+    serde_json::from_str::<ViewerResolveProbe>(&value)
+        .map_err(|error| format!("Could not read viewer resolver result: {error}"))
+}
+
+async fn wait_for_viewer_ready(webview: &tauri::Webview, timeout_ms: u64) {
+    let timeout_at = Instant::now() + Duration::from_millis(timeout_ms.min(60_000));
+    while Instant::now() < timeout_at {
+        if let Ok(value) = eval_webview_json(
+            webview,
+            "(() => document.readyState)()".to_string(),
+            1_000,
+        )
+        .await
+        {
+            if let Ok(state) = serde_json::from_str::<String>(&value) {
+                if state == "interactive" || state == "complete" {
+                    return;
+                }
+            }
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+}
+
+async fn eval_webview_json(
+    webview: &tauri::Webview,
+    script: String,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    let (sender, receiver) = oneshot::channel::<String>();
+    let sender = Mutex::new(Some(sender));
+    webview
+        .eval_with_callback(script, move |value| {
+            if let Ok(mut sender) = sender.lock() {
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(value);
+                }
+            }
+        })
+        .map_err(|error| format!("Could not inspect viewer page: {error}"))?;
+
+    timeout(Duration::from_millis(timeout_ms), receiver)
+        .await
+        .map_err(|_| "Timed out inspecting viewer page.".to_string())?
+        .map_err(|_| "Viewer inspection callback was cancelled.".to_string())
+}
+
+fn viewer_probe_script(source: &SourceConfig) -> Result<String, String> {
+    let watch_selector = source.watch_button_selector.clone().unwrap_or_default();
+    let player_selector = source
+        .player_selector
+        .clone()
+        .unwrap_or_else(|| "video, iframe".to_string());
+    let patterns = source
+        .watch_link_text_patterns
+        .iter()
+        .map(|pattern| normalize_comparable_title(pattern))
+        .filter(|pattern| !pattern.is_empty())
+        .collect::<Vec<_>>();
+    let watch_selector_json = serde_json::to_string(&watch_selector)
+        .map_err(|error| format!("Could not serialize selector: {error}"))?;
+    let player_selector_json = serde_json::to_string(&player_selector)
+        .map_err(|error| format!("Could not serialize player selector: {error}"))?;
+    let patterns_json = serde_json::to_string(&patterns)
+        .map_err(|error| format!("Could not serialize watch text patterns: {error}"))?;
+
+    Ok(format!(
+        r#"
+(() => {{
+  const playerSelector = {player_selector_json};
+  const watchButtonSelector = {watch_selector_json};
+  const patterns = {patterns_json};
+  const safeQueryAll = (selector) => {{
+    if (!selector || !String(selector).trim()) return [];
+    try {{ return Array.from(document.querySelectorAll(selector)); }} catch (_) {{ return []; }}
+  }};
+  const normalize = (value) => String(value || "")
+    .toLowerCase()
+    .replace(/[^\p{{L}}\p{{N}}]+/gu, " ")
+    .replace(/\b(full|movie|watch|online|hd|free|season|episode|ep|show|film|смотреть)\b/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const visible = (element) => {{
+    if (!element) return false;
+    const style = window.getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") return false;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }};
+  const elementUrl = (element) => {{
+    const raw = element?.getAttribute("href") || element?.getAttribute("data-href") || element?.getAttribute("data-url");
+    if (!raw || raw.startsWith("javascript:") || raw.startsWith("mailto:")) return null;
+    try {{ return new URL(raw, window.location.href).toString(); }} catch (_) {{ return null; }}
+  }};
+  if (safeQueryAll(playerSelector).some(visible)) {{
+    return {{ kind: "player", url: window.location.href }};
+  }}
+
+  const selectorMatches = safeQueryAll(watchButtonSelector).filter(visible);
+  const textMatches = Array.from(document.querySelectorAll("a[href], button, [role='button'], [data-href], [data-url]"))
+    .filter(visible)
+    .filter((element) => {{
+      const text = normalize([
+        element.textContent || "",
+        element.getAttribute("title") || "",
+        element.getAttribute("aria-label") || ""
+      ].join(" "));
+      return text && patterns.some((pattern) => pattern && text.includes(pattern));
+    }});
+  const candidates = selectorMatches.length ? selectorMatches : textMatches;
+  const match = candidates[0];
+  if (!match) return {{ kind: "none", url: window.location.href }};
+  const url = elementUrl(match);
+  if (url) return {{ kind: "link", url }};
+  document.querySelectorAll("[data-cinefinder-watch-target]").forEach((element) => element.removeAttribute("data-cinefinder-watch-target"));
+  match.setAttribute("data-cinefinder-watch-target", "true");
+  return {{ kind: "click", url: window.location.href }};
+}})()
+"#
+    ))
+}
+
+fn viewer_click_candidate_script() -> String {
+    r#"
+(() => {
+  const target = document.querySelector("[data-cinefinder-watch-target]");
+  if (target) {
+    target.removeAttribute("data-cinefinder-watch-target");
+    target.click();
+  }
+})()
+"#
+    .to_string()
+}
+
+fn viewer_initialization_script() -> String {
+    r#"
+(() => {
+  const openInPlace = (url) => {
+    if (!url) return null;
+    try {
+      window.location.href = new URL(String(url), window.location.href).toString();
+    } catch (_) {
+      window.location.href = String(url);
+    }
+    return null;
+  };
+  window.open = openInPlace;
+  document.addEventListener("click", (event) => {
+    const target = event.target && event.target.closest ? event.target.closest("a[target='_blank'], a[target='blank']") : null;
+    if (target && target.href) {
+      event.preventDefault();
+      openInPlace(target.href);
+    }
+  }, true);
+})()
+"#
+    .to_string()
+}
+
+fn emit_viewer_state(
+    app: &tauri::AppHandle,
+    label: &str,
+    status: &str,
+    url: Option<String>,
+    message: Option<String>,
+) {
+    let _ = app.emit(
+        VIEWER_EVENT,
+        ViewerEventPayload {
+            label: label.to_string(),
+            status: status.to_string(),
+            url,
+            message,
+        },
+    );
+}
+
+fn close_viewer_by_label(app: &tauri::AppHandle, label: &str) {
+    if let Some(webview) = app.get_webview(label) {
+        let _ = webview.close();
+    }
+}
+
+fn current_webview_url(webview: &tauri::Webview, fallback: &str) -> String {
+    webview
+        .url()
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| fallback.to_string())
+}
+
+fn parse_external_http_url(value: &str) -> Result<Url, String> {
+    let parsed = Url::parse(value.trim()).map_err(|_| "URL must be absolute.".to_string())?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed),
+        _ => Err("Only http and https URLs can be opened.".to_string()),
+    }
+}
+
 fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
@@ -634,6 +1234,11 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           config_json TEXT NOT NULL,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS deleted_default_sources (
+          default_source_id TEXT PRIMARY KEY,
+          deleted_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS favorites (
@@ -773,6 +1378,12 @@ fn save_source_to_db(
         is_default: source.is_default,
         user_modified: source.user_modified,
         hidden: source.hidden,
+        is_deleted: source.is_deleted,
+        deleted_at: if source.is_deleted {
+            clean_string(source.deleted_at)
+        } else {
+            None
+        },
         note: clean_string(source.note),
         source_kind: normalized_source_kind(&source.source_kind),
         source_type: normalized_source_type(&source.source_type),
@@ -809,10 +1420,13 @@ fn save_source_to_db(
         episode_selector: clean_string(source.episode_selector),
         season_selector: clean_string(source.season_selector),
         player_selector: clean_string(source.player_selector).or_else(|| Some("video, iframe".to_string())),
+        auto_resolve_watch_page: source.auto_resolve_watch_page,
         auto_open_first_watch_link: source.auto_open_first_watch_link,
         auto_open_best_match: source.auto_open_best_match,
         auto_open_watch_button: source.auto_open_watch_button,
-        max_watch_resolve_steps: source.max_watch_resolve_steps.min(5),
+        max_watch_resolve_steps: source.max_resolve_steps.min(5),
+        max_resolve_steps: source.max_resolve_steps.min(5),
+        resolve_delay_ms: source.resolve_delay_ms.min(10_000),
         exact_match_threshold: source.exact_match_threshold.clamp(50, 100),
         requires_javascript: source.requires_javascript,
         headers: source.headers,
@@ -849,11 +1463,16 @@ fn migrate_default_sources(
     restore_hidden: bool,
     reset_all: bool,
 ) -> Result<(), String> {
+    if restore_hidden || reset_all {
+        conn.execute("DELETE FROM deleted_default_sources", [])
+            .map_err(|error| format!("Could not restore deleted defaults: {error}"))?;
+    }
     let sources = read_sources(conn)?;
+    let deleted_default_ids = read_deleted_default_source_ids(conn)?;
     let mut seen_default_ids = HashSet::new();
 
     for source in sources {
-        let source = infer_default_metadata(source);
+        let source = migrate_legacy_deleted_source(infer_default_metadata(source));
         if is_removed_or_wrong_source(&source) {
             conn.execute("DELETE FROM sources WHERE id = ?1", params![source.id])
                 .map_err(|error| format!("Could not remove old source preset: {error}"))?;
@@ -878,16 +1497,28 @@ fn migrate_default_sources(
                             } else {
                                 source.hidden
                             },
+                            is_deleted: if restore_hidden || reset_all {
+                                false
+                            } else {
+                                source.is_deleted
+                            },
+                            deleted_at: if restore_hidden || reset_all {
+                                None
+                            } else {
+                                source.deleted_at
+                            },
                             created_at: source.created_at,
                             updated_at: source.updated_at,
                             ..default_source
                         },
                     )?;
-                } else if restore_hidden && source.hidden {
+                } else if restore_hidden && (source.hidden || source.is_deleted) {
                     save_source_to_db(
                         conn,
                         SourceConfig {
                             hidden: false,
+                            is_deleted: false,
+                            deleted_at: None,
                             enabled: true,
                             ..source
                         },
@@ -912,10 +1543,54 @@ fn migrate_default_sources(
         if seen_default_ids.contains(&default_source_id) {
             continue;
         }
+        if deleted_default_ids.contains(&default_source_id) {
+            continue;
+        }
         save_source_to_db(conn, default_source)?;
     }
 
     Ok(())
+}
+
+fn migrate_legacy_deleted_source(source: SourceConfig) -> SourceConfig {
+    if source.hidden && (source.is_default || source.default_source_id.is_some()) {
+        SourceConfig {
+            hidden: false,
+            is_deleted: true,
+            deleted_at: source
+                .deleted_at
+                .clone()
+                .or_else(|| Some(Utc::now().to_rfc3339())),
+            user_modified: true,
+            ..source
+        }
+    } else {
+        source
+    }
+}
+
+fn remember_deleted_default_source(
+    conn: &Connection,
+    default_source_id: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO deleted_default_sources (default_source_id, deleted_at)
+         VALUES (?1, ?2)",
+        params![default_source_id, Utc::now().to_rfc3339()],
+    )
+    .map_err(|error| format!("Could not remember deleted default source: {error}"))?;
+    Ok(())
+}
+
+fn read_deleted_default_source_ids(conn: &Connection) -> Result<HashSet<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT default_source_id FROM deleted_default_sources")
+        .map_err(|error| format!("Could not read deleted default sources: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Could not read deleted default sources: {error}"))?;
+    rows.collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| format!("Could not collect deleted default sources: {error}"))
 }
 
 async fn search_single_source(source: SourceConfig, query: String) -> SourceSearchOutcome {
@@ -1511,15 +2186,16 @@ async fn resolve_watch_url(
     source: &SourceConfig,
     result_url: &str,
 ) -> Option<String> {
-    let can_auto_resolve = source.watch_button_selector.is_some()
+    let can_auto_resolve = source.auto_resolve_watch_page
+        && (source.watch_button_selector.is_some()
         || source.auto_open_watch_button
-        || source.auto_open_first_watch_link;
+        || source.auto_open_first_watch_link);
     if !can_auto_resolve {
         return None;
     }
 
     let mut current_url = result_url.to_string();
-    for _step in 0..source.max_watch_resolve_steps.min(5) {
+    for _step in 0..source.max_resolve_steps.min(5) {
         let response = client
             .get(&current_url)
             .headers(headers.clone())
@@ -2458,6 +3134,7 @@ fn is_noise_match_token(token: &str) -> bool {
         token,
         "season" | "episode" | "series" | "show" | "movie" | "film" | "full" | "watch"
             | "online" | "hd" | "uhd"
+            | "смотреть"
     ) || (token.len() <= 4
         && (token.starts_with('s') || token.starts_with('e'))
         && token.chars().skip(1).all(|character| character.is_ascii_digit()))
@@ -2630,6 +3307,8 @@ fn create_default_source(
         is_default: true,
         user_modified: false,
         hidden: false,
+        is_deleted: false,
+        deleted_at: None,
         note: Some(note.to_string()),
         source_kind: "web".to_string(),
         source_type: "search".to_string(),
@@ -2666,10 +3345,13 @@ fn create_default_source(
         episode_selector: None,
         season_selector: None,
         player_selector: Some("video, iframe".to_string()),
+        auto_resolve_watch_page: true,
         auto_open_first_watch_link: false,
         auto_open_best_match: true,
         auto_open_watch_button: true,
         max_watch_resolve_steps: 2,
+        max_resolve_steps: 2,
+        resolve_delay_ms: 1500,
         exact_match_threshold: 85,
         requires_javascript: true,
         headers: HashMap::new(),

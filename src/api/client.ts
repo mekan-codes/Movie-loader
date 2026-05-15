@@ -25,6 +25,7 @@ const isTauri = () =>
 
 const storageKeys = {
   sources: "cinefinder.sources",
+  deletedDefaultSources: "cinefinder.deletedDefaultSources",
   favorites: "cinefinder.favorites",
   history: "cinefinder.history"
 };
@@ -121,16 +122,64 @@ export const api = {
       return invoke<void>("delete_source", { sourceId });
     }
     const sources = migrateStoredSources(readStorage<SourceConfig[]>(storageKeys.sources, []));
-    const target = sources.find((source) => source.id === sourceId);
+    const now = new Date().toISOString();
     writeStorage(
       storageKeys.sources,
-      target?.isDefault
-        ? sources.map((source) =>
-            source.id === sourceId
-              ? { ...source, enabled: false, hidden: true, userModified: true }
-              : source
-          )
-        : sources.filter((source) => source.id !== sourceId)
+      sources.map((source) =>
+        source.id === sourceId
+          ? {
+              ...source,
+              hidden: false,
+              isDeleted: true,
+              deletedAt: now,
+              userModified: source.isDefault ? true : source.userModified
+            }
+          : source
+      )
+    );
+  },
+
+  async restoreSource(sourceId: string): Promise<void> {
+    if (isTauri()) {
+      return invoke<void>("restore_source", { sourceId });
+    }
+    const sources = migrateStoredSources(readStorage<SourceConfig[]>(storageKeys.sources, []));
+    writeStorage(
+      storageKeys.sources,
+      sources.map((source) =>
+        source.id === sourceId
+          ? { ...source, hidden: false, isDeleted: false, deletedAt: null }
+          : source
+      )
+    );
+  },
+
+  async permanentlyDeleteSource(sourceId: string): Promise<void> {
+    if (isTauri()) {
+      return invoke<void>("permanently_delete_source", { sourceId });
+    }
+    const sources = migrateStoredSources(readStorage<SourceConfig[]>(storageKeys.sources, []));
+    const target = sources.find((source) => source.id === sourceId);
+    if (target?.defaultSourceId) {
+      addDeletedDefaultSourceId(target.defaultSourceId);
+    }
+    writeStorage(
+      storageKeys.sources,
+      sources.filter((source) => source.id !== sourceId)
+    );
+  },
+
+  async emptySourceTrash(): Promise<void> {
+    if (isTauri()) {
+      return invoke<void>("empty_source_trash");
+    }
+    const sources = migrateStoredSources(readStorage<SourceConfig[]>(storageKeys.sources, []));
+    sources
+      .filter((source) => source.isDeleted && source.defaultSourceId)
+      .forEach((source) => addDeletedDefaultSourceId(source.defaultSourceId as string));
+    writeStorage(
+      storageKeys.sources,
+      sources.filter((source) => !source.isDeleted)
     );
   },
 
@@ -143,6 +192,8 @@ export const api = {
       defaultSourceId: null,
       userModified: false,
       hidden: false,
+      isDeleted: false,
+      deletedAt: null,
       createdAt: null,
       updatedAt: null
     });
@@ -166,6 +217,8 @@ export const api = {
       id: current.id,
       createdAt: current.createdAt,
       hidden: false,
+      isDeleted: false,
+      deletedAt: null,
       enabled: true,
       userModified: false,
       updatedAt: new Date().toISOString()
@@ -181,6 +234,7 @@ export const api = {
     if (isTauri()) {
       return invoke<SourceConfig[]>("restore_default_sources");
     }
+    writeStorage(storageKeys.deletedDefaultSources, []);
     const sources = migrateStoredSources(readStorage<SourceConfig[]>(storageKeys.sources, []), {
       restoreHidden: true
     });
@@ -192,6 +246,7 @@ export const api = {
     if (isTauri()) {
       return invoke<SourceConfig[]>("reset_all_default_sources");
     }
+    writeStorage(storageKeys.deletedDefaultSources, []);
     const sources = migrateStoredSources(readStorage<SourceConfig[]>(storageKeys.sources, []));
     const reset = sources.map((source) => {
       const defaultSource = defaultSources.find(
@@ -311,6 +366,7 @@ async function searchCustomSources(
     .map(normalizeSource)
     .filter((source) => source.enabled)
     .filter((source) => !source.hidden)
+    .filter((source) => !source.isDeleted)
     .filter((source) => !selectedSourceIds?.length || selectedSourceIds.includes(source.id));
 
   return searchStoredSources(query, sources);
@@ -363,9 +419,23 @@ function migrateStoredSources(
   options: { restoreHidden?: boolean } = {}
 ): SourceConfig[] {
   const now = new Date().toISOString();
+  const deletedDefaultIds = new Set(
+    readStorage<string[]>(storageKeys.deletedDefaultSources, [])
+  );
   const byDefaultId = new Map<string, SourceConfig>();
   const migrated = storedSources
     .map((source) => inferDefaultMetadata(normalizeSource(source)))
+    .map((source) =>
+      source.hidden && (source.isDefault || source.defaultSourceId)
+        ? {
+            ...source,
+            hidden: false,
+            isDeleted: true,
+            deletedAt: source.deletedAt || now,
+            userModified: true
+          }
+        : source
+    )
     .filter((source) => !isWrongSource(source))
     .filter((source) => !isRemovedDefaultSource(source))
     .map((source) => {
@@ -376,8 +446,8 @@ function migrateStoredSources(
         return source;
       }
       if (source.userModified) {
-        return options.restoreHidden && source.hidden
-          ? { ...source, hidden: false, enabled: true }
+        return options.restoreHidden && (source.hidden || source.isDeleted)
+          ? { ...source, hidden: false, isDeleted: false, deletedAt: null, enabled: true }
           : source;
       }
       return normalizeSource({
@@ -385,6 +455,8 @@ function migrateStoredSources(
         id: source.id,
         enabled: source.enabled,
         hidden: options.restoreHidden ? false : source.hidden,
+        isDeleted: options.restoreHidden ? false : source.isDeleted,
+        deletedAt: options.restoreHidden ? null : source.deletedAt,
         createdAt: source.createdAt,
         updatedAt: source.updatedAt || now
       });
@@ -397,7 +469,11 @@ function migrateStoredSources(
   });
 
   for (const defaultSource of defaultSources) {
-    if (!defaultSource.defaultSourceId || byDefaultId.has(defaultSource.defaultSourceId)) {
+    if (
+      !defaultSource.defaultSourceId ||
+      byDefaultId.has(defaultSource.defaultSourceId) ||
+      deletedDefaultIds.has(defaultSource.defaultSourceId)
+    ) {
       continue;
     }
     migrated.push(
@@ -1042,6 +1118,7 @@ function normalizeComparableTitle(value: string): string {
     .replace(/\b(v)\b/g, "5")
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .replace(/\b(full|movie|watch|online|hd|free|season|episode|ep|show|film|смотреть|онлайн)\b/gu, " ")
+    .replace(/\b(смотреть)\b/gu, " ")
     .replace(/\b(s\d{1,2}|e\d{1,3}|ep\d{1,3})\b/gu, " ")
     .trim()
     .replace(/\s+/g, " ");
@@ -1264,15 +1341,19 @@ async function resolveBrowserWatchUrl(
   resultUrl: string
 ): Promise<string | null> {
   const canAutoResolve =
-    Boolean(source.watchButtonSelector) ||
-    source.autoOpenWatchButton ||
-    source.autoOpenFirstWatchLink;
+    source.autoResolveWatchPage !== false &&
+    (Boolean(source.watchButtonSelector) ||
+      source.autoOpenWatchButton ||
+      source.autoOpenFirstWatchLink);
   if (!canAutoResolve) {
     return null;
   }
 
   let currentUrl = resultUrl;
-  const maxSteps = Math.max(0, Math.min(source.maxWatchResolveSteps ?? 2, 5));
+  const maxSteps = Math.max(
+    0,
+    Math.min(source.maxResolveSteps ?? source.maxWatchResolveSteps ?? 2, 5)
+  );
   try {
     for (let step = 0; step < maxSteps; step += 1) {
       const controller = new AbortController();
@@ -1445,4 +1526,10 @@ function readStorage<T>(key: string, fallback: T): T {
 
 function writeStorage<T>(key: string, value: T): void {
   localStorage.setItem(key, JSON.stringify(value));
+}
+
+function addDeletedDefaultSourceId(defaultSourceId: string): void {
+  const ids = new Set(readStorage<string[]>(storageKeys.deletedDefaultSources, []));
+  ids.add(defaultSourceId);
+  writeStorage(storageKeys.deletedDefaultSources, Array.from(ids));
 }

@@ -1,12 +1,32 @@
-import { ArrowLeft, ExternalLink, Maximize2, MonitorPlay, RefreshCw, Star } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  ExternalLink,
+  Maximize2,
+  RefreshCw,
+  Star
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isPlayableVideoUrl } from "../media";
-import { openProviderWindow } from "../openProviderWindow";
-import type { Favorite, SearchResult } from "../types";
-import { cx } from "../utils";
+import {
+  closeNativeViewer,
+  goBackNativeViewer,
+  goForwardNativeViewer,
+  isDesktopApp,
+  listenToNativeViewer,
+  nativeViewerLabel,
+  openNativeViewer,
+  reloadNativeViewer,
+  resizeNativeViewer,
+  type ViewerBounds,
+  type ViewerStatusText
+} from "../nativeViewer";
+import type { Favorite, SearchResult, SourceConfig } from "../types";
+import { createId, cx, normalizeSource } from "../utils";
 
 interface ViewerViewProps {
   item: SearchResult | null;
+  source?: SourceConfig | null;
   favorites: Favorite[];
   canGoBack: boolean;
   onBack: () => void;
@@ -16,6 +36,7 @@ interface ViewerViewProps {
 
 export function ViewerView({
   item,
+  source,
   favorites,
   canGoBack,
   onBack,
@@ -24,15 +45,137 @@ export function ViewerView({
 }: ViewerViewProps) {
   const [frameLoaded, setFrameLoaded] = useState(false);
   const [frameKey, setFrameKey] = useState(0);
-  const [launchState, setLaunchState] = useState<"idle" | "opening" | "opened" | "failed">("idle");
-  const [launchError, setLaunchError] = useState<string | null>(null);
+  const [viewerStatus, setViewerStatus] = useState<ViewerStatusText>("Opening result page");
+  const [currentUrl, setCurrentUrl] = useState(item?.url ?? "");
+  const [nativeError, setNativeError] = useState<string | null>(null);
+  const [nativeOpening, setNativeOpening] = useState(false);
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const lastBoundsRef = useRef<ViewerBounds | null>(null);
+
+  const playableUrl = item?.playableUrl || (item && isPlayableVideoUrl(item.url) ? item.url : null);
+  const shouldUseWebView = Boolean(item && item.openMode === "webview" && !playableUrl);
+  const desktopApp = isDesktopApp();
+  const viewerSource = useMemo(
+    () => (item ? normalizeSource(source ?? fallbackSourceForItem(item)) : null),
+    [item, source]
+  );
 
   useEffect(() => {
     setFrameLoaded(false);
     setFrameKey(0);
-    setLaunchState("idle");
-    setLaunchError(null);
+    setCurrentUrl(item?.url ?? "");
+    setViewerStatus("Opening result page");
+    setNativeError(null);
+    setNativeOpening(false);
   }, [item?.url]);
+
+  useEffect(() => {
+    if (!desktopApp) {
+      return;
+    }
+    let mounted = true;
+    let unlisten: (() => void) | null = null;
+    void listenToNativeViewer((event) => {
+      if (!mounted || event.label !== nativeViewerLabel) {
+        return;
+      }
+      setViewerStatus(event.status);
+      if (event.url) {
+        setCurrentUrl(event.url);
+      }
+      if (event.message) {
+        setNativeError(event.message);
+      }
+    }).then((nextUnlisten) => {
+      unlisten = nextUnlisten;
+      if (!mounted) {
+        nextUnlisten();
+      }
+    });
+    return () => {
+      mounted = false;
+      unlisten?.();
+    };
+  }, [desktopApp]);
+
+  const readHostBounds = useCallback((): ViewerBounds | null => {
+    const host = hostRef.current;
+    if (!host) {
+      return null;
+    }
+    const rect = host.getBoundingClientRect();
+    if (rect.width < 8 || rect.height < 8) {
+      return null;
+    }
+    return {
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height)
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!desktopApp || !shouldUseWebView || !item || !viewerSource) {
+      void closeNativeViewer();
+      return;
+    }
+
+    let cancelled = false;
+    let openTimer = 0;
+
+    const openWhenMeasured = () => {
+      const bounds = readHostBounds();
+      if (!bounds) {
+        openTimer = window.setTimeout(openWhenMeasured, 80);
+        return;
+      }
+      lastBoundsRef.current = bounds;
+      setViewerStatus("Opening result page");
+      setNativeOpening(true);
+      void openNativeViewer(item.url, bounds, viewerSource)
+        .then((result) => {
+          if (cancelled) {
+            void closeNativeViewer();
+            return;
+          }
+          setNativeOpening(false);
+          setViewerStatus(result.status);
+          setCurrentUrl(result.finalUrl);
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            setNativeOpening(false);
+            setViewerStatus("Could not auto-resolve, showing result page");
+            setNativeError(error instanceof Error ? error.message : String(error));
+          }
+        });
+    };
+
+    openWhenMeasured();
+
+    const updateNativeBounds = () => {
+      const bounds = readHostBounds();
+      if (!bounds) {
+        return;
+      }
+      lastBoundsRef.current = bounds;
+      void resizeNativeViewer(bounds);
+    };
+    const observer = new ResizeObserver(updateNativeBounds);
+    if (hostRef.current) {
+      observer.observe(hostRef.current);
+    }
+    window.addEventListener("resize", updateNativeBounds);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(openTimer);
+      observer.disconnect();
+      window.removeEventListener("resize", updateNativeBounds);
+      void closeNativeViewer();
+    };
+  }, [desktopApp, item, readHostBounds, shouldUseWebView, viewerSource]);
 
   if (!item) {
     return (
@@ -53,34 +196,32 @@ export function ViewerView({
   }
 
   const isFavorite = favorites.some((favorite) => favorite.url === item.url);
-  const playableUrl = item.playableUrl || (isPlayableVideoUrl(item.url) ? item.url : null);
-  const shouldUseWebView = item.openMode === "webview" && !playableUrl;
-  const isDesktopApp =
-    typeof window !== "undefined" && typeof window.__TAURI_INTERNALS__ !== "undefined";
+  const externalTarget = { ...item, url: currentUrl || item.url };
+  const visibleViewerStatus: ViewerStatusText =
+    nativeOpening && viewerStatus === "Ready" && viewerSource?.autoResolveWatchPage !== false
+      ? "Looking for player"
+      : viewerStatus;
+
   const enterFullscreen = async () => {
     const shell = document.querySelector(".browser-shell");
     await shell?.requestFullscreen?.();
+    const bounds = readHostBounds();
+    if (bounds) {
+      await resizeNativeViewer(bounds);
+    }
   };
-  const launchDesktopWebView = useCallback(async () => {
-    if (!item) {
+
+  const refreshViewer = () => {
+    setViewerStatus("Opening result page");
+    if (desktopApp && shouldUseWebView) {
+      void reloadNativeViewer().catch((error) =>
+        setNativeError(error instanceof Error ? error.message : String(error))
+      );
       return;
     }
-    setLaunchState("opening");
-    setLaunchError(null);
-    try {
-      await openProviderWindow(item.url, item.title, { fallbackExternal: false });
-      setLaunchState("opened");
-    } catch (error) {
-      setLaunchState("failed");
-      setLaunchError(error instanceof Error ? error.message : String(error));
-    }
-  }, [item]);
-
-  useEffect(() => {
-    if (shouldUseWebView && isDesktopApp && launchState === "idle") {
-      void launchDesktopWebView();
-    }
-  }, [isDesktopApp, launchDesktopWebView, launchState, shouldUseWebView]);
+    setFrameLoaded(false);
+    setFrameKey((current) => current + 1);
+  };
 
   return (
     <section className="view viewer-view">
@@ -98,7 +239,7 @@ export function ViewerView({
           <div className="viewer-title">
             <span className="source-badge">{item.sourceName}</span>
             <h1>{item.title}</h1>
-            <p>{item.url}</p>
+            <p>{currentUrl || item.url}</p>
           </div>
         </div>
         <div className="toolbar">
@@ -106,7 +247,7 @@ export function ViewerView({
             <button
               className="secondary-button"
               type="button"
-              onClick={() => onOpenExternal(item)}
+              onClick={() => onOpenExternal(externalTarget)}
             >
               <ExternalLink size={17} />
               <span>Browser</span>
@@ -138,66 +279,59 @@ export function ViewerView({
         <div className="browser-shell">
           <div className="webview-toolbar">
             <span>
-              {isDesktopApp
-                ? launchState === "opened"
-                  ? "Opened in CineFinder WebView"
-                  : launchState === "opening"
-                    ? "Opening CineFinder WebView"
-                    : launchState === "failed"
-                      ? "Could not open app WebView"
-                      : "Ready to open app WebView"
-                : frameLoaded
-                  ? "Loaded in browser preview"
-                  : "Loading browser preview"}
+              {desktopApp ? visibleViewerStatus : frameLoaded ? "Ready" : "Opening result page"}
             </span>
             <div className="toolbar">
-              {!isDesktopApp && (
+              {desktopApp && (
                 <>
-                  <button className="icon-button" type="button" onClick={() => void enterFullscreen()} title="Fullscreen">
-                    <Maximize2 size={16} />
+                  <button
+                    className="icon-button"
+                    type="button"
+                    onClick={() => void goBackNativeViewer()}
+                    title="Back in viewer"
+                  >
+                    <ArrowLeft size={16} />
                   </button>
                   <button
                     className="icon-button"
                     type="button"
-                    onClick={() => {
-                      setFrameLoaded(false);
-                      setFrameKey((current) => current + 1);
-                    }}
-                    title="Refresh"
+                    onClick={() => void goForwardNativeViewer()}
+                    title="Forward in viewer"
                   >
-                    <RefreshCw size={16} />
+                    <ArrowRight size={16} />
                   </button>
                 </>
               )}
-              {isDesktopApp && (
-                <button className="secondary-button" type="button" onClick={() => void launchDesktopWebView()}>
-                  <MonitorPlay size={17} />
-                  <span>{launchState === "opened" ? "Reopen" : "Open app WebView"}</span>
-                </button>
-              )}
-              <button className="secondary-button" type="button" onClick={() => onOpenExternal(item)}>
+              <button
+                className="icon-button"
+                type="button"
+                onClick={() => void enterFullscreen()}
+                title="Fullscreen"
+              >
+                <Maximize2 size={16} />
+              </button>
+              <button className="icon-button" type="button" onClick={refreshViewer} title="Refresh">
+                <RefreshCw size={16} />
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => onOpenExternal(externalTarget)}
+              >
                 <ExternalLink size={17} />
                 <span>Browser</span>
               </button>
             </div>
           </div>
-          {isDesktopApp ? (
-            <div className="empty-panel provider-launch-panel">
-              <MonitorPlay size={24} />
-              <strong>
-                {launchState === "opened"
-                  ? "Provider page opened in a CineFinder WebView window"
-                  : launchState === "opening"
-                    ? "Opening provider page"
-                    : launchState === "failed"
-                      ? "Provider WebView did not open"
-                      : "Open this provider in CineFinder"}
-              </strong>
-              <span>
-                This uses a real Tauri WebView instead of an iframe, so sites that block embedding
-                can still load inside the desktop app.
-              </span>
-              {launchError && <small>{launchError}</small>}
+          {desktopApp ? (
+            <div className="native-webview-host" ref={hostRef}>
+              {(nativeOpening || viewerStatus !== "Ready" || nativeError) && (
+                <div className="viewer-loading-overlay">
+                  <RefreshCw className="spin" size={18} />
+                  <strong>{visibleViewerStatus}</strong>
+                  {nativeError && <span>{nativeError}</span>}
+                </div>
+              )}
             </div>
           ) : (
             <iframe
@@ -206,8 +340,12 @@ export function ViewerView({
               title={item.title}
               allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
               allowFullScreen
+              sandbox="allow-forms allow-modals allow-pointer-lock allow-presentation allow-same-origin allow-scripts"
               referrerPolicy="no-referrer"
-              onLoad={() => setFrameLoaded(true)}
+              onLoad={() => {
+                setFrameLoaded(true);
+                setViewerStatus("Ready");
+              }}
             />
           )}
         </div>
@@ -220,4 +358,78 @@ export function ViewerView({
       )}
     </section>
   );
+}
+
+function fallbackSourceForItem(item: SearchResult): SourceConfig {
+  const baseUrl = (() => {
+    try {
+      return new URL(item.url).origin;
+    } catch {
+      return item.url;
+    }
+  })();
+
+  return {
+    id: item.sourceId || createId("viewer-source"),
+    name: item.sourceName || "Viewer source",
+    enabled: true,
+    isDefault: false,
+    userModified: false,
+    hidden: false,
+    isDeleted: false,
+    deletedAt: null,
+    sourceKind: "web",
+    sourceType: "directPage",
+    sourceOpenBehavior: "webview",
+    resultOpenBehavior: "result_page",
+    ambiguousQueryBehavior: "show_choices",
+    baseUrl,
+    searchUrl: item.url,
+    method: "GET",
+    resultSelector: "",
+    loadDelayMs: 1500,
+    maxRetries: 2,
+    requestTimeoutMs: 15000,
+    waitForSelector: "",
+    titleSelector: "",
+    posterSelector: "",
+    posterAttribute: "src",
+    linkSelector: "",
+    linkAttribute: "href",
+    yearSelector: "",
+    descriptionSelector: "",
+    videoSelector: "",
+    videoAttribute: "src",
+    iframeSelector: "iframe",
+    iframeAttribute: "src",
+    subtitleSelector: "",
+    subtitleAttribute: "src",
+    subtitleLanguageAttribute: "srclang",
+    audioLanguageSelector: "",
+    downloadSelector: "",
+    downloadAttribute: "href",
+    watchButtonSelector: "",
+    watchLinkTextPatterns: [
+      "watch full movie",
+      "watch online",
+      "watch now",
+      "play",
+      "start watching",
+      "смотреть",
+      "смотреть онлайн"
+    ],
+    episodeSelector: "",
+    seasonSelector: "",
+    playerSelector: "video, iframe",
+    autoResolveWatchPage: true,
+    autoOpenFirstWatchLink: false,
+    autoOpenBestMatch: true,
+    autoOpenWatchButton: true,
+    maxWatchResolveSteps: 2,
+    maxResolveSteps: 2,
+    resolveDelayMs: 1500,
+    exactMatchThreshold: 85,
+    requiresJavaScript: true,
+    headers: {}
+  };
 }

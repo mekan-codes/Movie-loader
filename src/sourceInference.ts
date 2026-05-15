@@ -30,6 +30,8 @@ export function inferSourceFromUrl(input: string): InferredSource {
     isDefault: false,
     userModified: false,
     hidden: false,
+    isDeleted: false,
+    deletedAt: null,
     sourceKind: "web",
     sourceType: "search",
     sourceOpenBehavior: "webview",
@@ -63,6 +65,7 @@ export function inferSourceFromUrl(input: string): InferredSource {
     watchButtonSelector: "",
     watchLinkTextPatterns: [
       "watch full movie",
+      "watch online",
       "watch now",
       "play",
       "start watching",
@@ -72,10 +75,13 @@ export function inferSourceFromUrl(input: string): InferredSource {
     episodeSelector: "",
     seasonSelector: "",
     playerSelector: "video, iframe",
+    autoResolveWatchPage: true,
     autoOpenFirstWatchLink: false,
     autoOpenBestMatch: true,
     autoOpenWatchButton: true,
     maxWatchResolveSteps: 2,
+    maxResolveSteps: 2,
+    resolveDelayMs: 1500,
     exactMatchThreshold: 85,
     requiresJavaScript: true,
     headers: {}
@@ -83,10 +89,9 @@ export function inferSourceFromUrl(input: string): InferredSource {
 
   return {
     source,
-    note:
-      builtIn
-        ? "Added as a web source. This site is also available as a built-in source."
-        : "Added as a web source. Searches open in the in-app viewer without selector setup."
+    note: builtIn
+      ? "Added as a web source. This site is also available as a built-in source."
+      : "Added as a web source. Searches open in the in-app viewer without selector setup."
   };
 }
 
@@ -147,14 +152,16 @@ function decodeQueryToken(value: string): string {
 }
 
 function readableHost(host: string): string {
-  return host
-    .replace(/^www\./, "")
-    .split(".")
-    .filter(Boolean)
-    .slice(0, -1)
-    .join(" ")
-    .replace(/(^|\s)\S/g, (match) => match.toUpperCase())
-    .trim() || host;
+  return (
+    host
+      .replace(/^www\./, "")
+      .split(".")
+      .filter(Boolean)
+      .slice(0, -1)
+      .join(" ")
+      .replace(/(^|\s)\S/g, (match) => match.toUpperCase())
+      .trim() || host
+  );
 }
 
 function slugify(value: string): string {

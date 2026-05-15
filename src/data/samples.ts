@@ -4,7 +4,8 @@ import { createId } from "../utils";
 const defaultTiming = {
   loadDelayMs: 1500,
   maxRetries: 2,
-  requestTimeoutMs: 15000
+  requestTimeoutMs: 15000,
+  resolveDelayMs: 1500
 };
 
 export const removedDefaultSourceIds = new Set([
@@ -65,6 +66,8 @@ export function createEmptySource(): SourceConfig {
     isDefault: false,
     userModified: false,
     hidden: false,
+    isDeleted: false,
+    deletedAt: null,
     sourceKind: "web",
     sourceType: "search",
     sourceOpenBehavior: "webview",
@@ -97,10 +100,12 @@ export function createEmptySource(): SourceConfig {
     episodeSelector: "",
     seasonSelector: "",
     playerSelector: "video, iframe",
+    autoResolveWatchPage: true,
     autoOpenFirstWatchLink: false,
     autoOpenBestMatch: true,
     autoOpenWatchButton: true,
     maxWatchResolveSteps: 2,
+    maxResolveSteps: 2,
     exactMatchThreshold: 85,
     requiresJavaScript: true,
     headers: {},
@@ -121,6 +126,8 @@ function createDefaultSource(input: {
     isDefault: true,
     userModified: false,
     hidden: false,
+    isDeleted: false,
+    deletedAt: null,
     name: input.name,
     enabled: true,
     note: input.note,
@@ -156,10 +163,12 @@ function createDefaultSource(input: {
     episodeSelector: "",
     seasonSelector: "",
     playerSelector: "video, iframe",
+    autoResolveWatchPage: true,
     autoOpenFirstWatchLink: false,
     autoOpenBestMatch: true,
     autoOpenWatchButton: true,
     maxWatchResolveSteps: 2,
+    maxResolveSteps: 2,
     exactMatchThreshold: 85,
     requiresJavaScript: true,
     headers: {},
@@ -170,6 +179,7 @@ function createDefaultSource(input: {
 function defaultWatchPatterns(): string[] {
   return [
     "watch full movie",
+    "watch online",
     "watch now",
     "play",
     "start watching",

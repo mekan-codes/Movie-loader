@@ -59,7 +59,9 @@ export function SearchView({
   onToggleFavorite
 }: SearchViewProps) {
   const [expandedSources, setExpandedSources] = useState<string[]>([]);
-  const enabledSources = sources.filter((source) => source.enabled && !source.hidden);
+  const enabledSources = sources.filter(
+    (source) => source.enabled && !source.hidden && !source.isDeleted
+  );
   const availableSourceCount = enabledSources.length + builtInSources.length;
   const selectedCount = selectedSourceIds.length;
   const totalResults = outcomes.reduce((sum, outcome) => sum + outcome.results.length, 0);

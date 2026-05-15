@@ -50,6 +50,13 @@ export function formatDate(value?: string | null): string {
 }
 
 export function normalizeSource(source: SourceConfig): SourceConfig {
+  const maxResolveSteps = clampNumber(
+    source.maxResolveSteps ?? source.maxWatchResolveSteps,
+    0,
+    5,
+    2
+  );
+
   return {
     ...source,
     id: source.id.trim() || createId("source"),
@@ -58,6 +65,8 @@ export function normalizeSource(source: SourceConfig): SourceConfig {
     isDefault: Boolean(source.isDefault),
     userModified: Boolean(source.userModified),
     hidden: Boolean(source.hidden),
+    isDeleted: Boolean(source.isDeleted),
+    deletedAt: source.isDeleted ? cleanOptional(source.deletedAt) : null,
     note: cleanOptional(source.note),
     sourceType: source.sourceType || "search",
     sourceOpenBehavior: source.sourceOpenBehavior || "webview",
@@ -97,10 +106,13 @@ export function normalizeSource(source: SourceConfig): SourceConfig {
     episodeSelector: cleanOptional(source.episodeSelector),
     seasonSelector: cleanOptional(source.seasonSelector),
     playerSelector: cleanOptional(source.playerSelector) || "video, iframe",
+    autoResolveWatchPage: source.autoResolveWatchPage !== false,
     autoOpenFirstWatchLink: Boolean(source.autoOpenFirstWatchLink),
     autoOpenBestMatch: source.autoOpenBestMatch !== false,
     autoOpenWatchButton: source.autoOpenWatchButton !== false,
-    maxWatchResolveSteps: clampNumber(source.maxWatchResolveSteps, 0, 5, 2),
+    maxWatchResolveSteps: maxResolveSteps,
+    maxResolveSteps,
+    resolveDelayMs: clampNumber(source.resolveDelayMs, 0, 10000, 1500),
     exactMatchThreshold: clampNumber(source.exactMatchThreshold, 50, 100, 85),
     headers: source.headers || {}
   };
@@ -227,6 +239,7 @@ function clampNumber(
 function defaultWatchPatterns(): string[] {
   return [
     "watch full movie",
+    "watch online",
     "watch now",
     "play",
     "start watching",

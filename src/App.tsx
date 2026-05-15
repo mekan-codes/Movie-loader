@@ -33,6 +33,7 @@ export default function App() {
   const [viewStack, setViewStack] = useState<ViewKey[]>([]);
   const [query, setQuery] = useState("");
   const [sources, setSources] = useState<SourceConfig[]>([]);
+  const [sourcesLoaded, setSourcesLoaded] = useState(false);
   const [favorites, setFavorites] = useState<Favorite[]>([]);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [outcomes, setOutcomes] = useState<SourceSearchOutcome[]>([]);
@@ -52,7 +53,12 @@ export default function App() {
   const webOpenDelayMs = Math.max(0, settings.webOpenDelaySeconds || 0) * 1000;
 
   const enabledSources = useMemo(
-    () => sources.filter((source) => source.enabled && !source.hidden),
+    () => sources.filter((source) => source.enabled && !source.hidden && !source.isDeleted),
+    [sources]
+  );
+
+  const visibleSourcesCount = useMemo(
+    () => sources.filter((source) => !source.isDeleted && !source.hidden).length,
     [sources]
   );
 
@@ -136,6 +142,15 @@ export default function App() {
     }
   }, [selectedSourceIds, settings.defaultSearchBehavior]);
 
+  useEffect(() => {
+    if (!sourcesLoaded) {
+      return;
+    }
+    const availableIds = new Set(enabledSources.map((source) => source.id));
+    setSelectedSourceIds((current) => current.filter((id) => availableIds.has(id)));
+    setOutcomes((current) => current.filter((outcome) => availableIds.has(outcome.sourceId)));
+  }, [enabledSources, sourcesLoaded]);
+
   const refreshData = async () => {
     const [nextSources, nextFavorites, nextHistory] = await Promise.all([
       api.listSources(),
@@ -143,6 +158,7 @@ export default function App() {
       api.listHistory()
     ]);
     setSources(nextSources);
+    setSourcesLoaded(true);
     setFavorites(nextFavorites);
     setHistory(nextHistory);
   };
@@ -216,12 +232,8 @@ export default function App() {
 
   const openResult = async (result: SearchResult) => {
     await copyResultQueryIfNeeded(result);
-    if (settings.openBehavior === "external") {
-      await openExternalUrl(result.url);
-    } else {
-      setViewerItem(result);
-      navigateTo("viewer");
-    }
+    setViewerItem(result);
+    navigateTo("viewer");
     await api.recordHistory(resultToHistory(result));
     await refreshFavoritesAndHistory();
   };
@@ -354,7 +366,7 @@ export default function App() {
       <Sidebar
         activeView={activeView}
         onViewChange={navigateTo}
-        sourcesCount={sources.length}
+        sourcesCount={visibleSourcesCount}
         favoritesCount={favorites.length}
         historyCount={history.length}
       />
@@ -393,6 +405,18 @@ export default function App() {
               await api.deleteSource(sourceId);
               setSources(await api.listSources());
             }}
+            onRestore={async (sourceId) => {
+              await api.restoreSource(sourceId);
+              setSources(await api.listSources());
+            }}
+            onPermanentDelete={async (sourceId) => {
+              await api.permanentlyDeleteSource(sourceId);
+              setSources(await api.listSources());
+            }}
+            onEmptyTrash={async () => {
+              await api.emptySourceTrash();
+              setSources(await api.listSources());
+            }}
             onTest={api.testSource}
             onImport={importSources}
             onDuplicate={async (source) => {
@@ -415,6 +439,15 @@ export default function App() {
         {activeView === "viewer" && (
           <ViewerView
             item={viewerItem}
+            source={
+              viewerItem
+                ? sources.find(
+                    (source) =>
+                      source.id === viewerItem.sourceId ||
+                      source.name === viewerItem.sourceName
+                  ) ?? null
+                : null
+            }
             favorites={favorites}
             canGoBack={viewStack.length > 0}
             onBack={goBack}
