@@ -1,0 +1,23 @@
+[package]
+name = "cinefinder"
+version = "0.1.0"
+description = "Source-based movie and video search aggregator"
+authors = ["CineFinder"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+scraper = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+url = "2"
